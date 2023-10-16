@@ -99,6 +99,9 @@ AC_SEARCH_LIBS([wandio_create], [wandio trace], [with_wandio=yes],
 		 )])
 AM_CONDITIONAL([WITH_WANDIO], [test "x$with_wandio" == xyes])
 
+AC_SEARCH_LIBS([PQexec], [pq], [with_pq=yes], [with_pq=no])
+AM_CONDITIONAL([WITH_PQ], [test "x$with_pq" == xyes])
+
 # Checks for header files.
 AC_CHECK_HEADERS([arpa/inet.h inttypes.h limits.h math.h stdlib.h string.h \
 			      time.h sys/time.h])
@@ -109,6 +112,12 @@ AC_CHECK_HEADERS([arpa/inet.h inttypes.h limits.h math.h stdlib.h string.h \
 AC_HEADER_ASSERT
 
 AC_SUBST(LIBIPMETA_LIBTOOL_VERSION)
+
+if test x"$with_pq" == xyes; then
+        AC_MSG_NOTICE(["Building tool load_ipmeta_into_psql_db: Yes"])
+else
+        AC_MSG_NOTICE(["Building tool load_ipmeta_into_psql_db: No"])
+fi
 
 AC_CONFIG_FILES([Makefile
 		common/Makefile

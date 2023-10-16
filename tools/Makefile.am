@@ -44,6 +44,14 @@ ipmeta_lookup_SOURCES = \
 ipmeta_lookup_LDADD = -lipmeta
 ipmeta_lookup_LDFLAGS = -L$(top_builddir)/lib
 
+if WITH_PQ
+bin_PROGRAMS += load-ipmeta-into-psql-db
+
+load_ipmeta_into_psql_db_SOURCES = load_ipmeta_into_psql_db.c
+load_ipmeta_into_psql_db_LDADD = -lipmeta -lpq
+load_ipmeta_into_psql_db_LDFLAGS = -L$(top_builddir)/lib
+endif
+
 ACLOCAL_AMFLAGS = -I m4
 
 CLEANFILES = *~
