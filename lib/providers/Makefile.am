@@ -50,9 +50,11 @@ libipmeta_providers_la_SOURCES = \
 	ipmeta_provider_ipinfo.c \
 	ipmeta_provider_ipinfo.h \
 	ipmeta_provider_maxmind.c \
-	ipmeta_provider_maxmind.h 
+	ipmeta_provider_maxmind.h \
+	ipmeta_provider_memcache_psql.c \
+	ipmeta_provider_memcache_psql.h
 
-libipmeta_providers_la_LIBADD =
+libipmeta_providers_la_LIBADD = @OPTIONAL_LIBS@
 
 ACLOCAL_AMFLAGS = -I m4
 

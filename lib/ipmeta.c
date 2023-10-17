@@ -180,6 +180,26 @@ inline int ipmeta_lookup_addr(ipmeta_t *ipmeta, int family, void *addrp,
                                         providermask, found);
 }
 
+inline int ipmeta_lookup_using_provider(ipmeta_t *ipmeta, const char *addr_str,
+        ipmeta_provider_t *provider, ipmeta_record_set_t *found) {
+
+  ipvx_prefix_t pfx;
+  int rc;
+
+  if ((rc = ipvx_pton_pfx(addr_str, &pfx)) < 0) {
+    return IPMETA_ERR_INPUT;
+  }
+
+  ipmeta_record_set_clear(found);
+  if (pfx.masklen == ipvx_family_size(pfx.family)) {
+    rc = provider->lookup_addr(provider, pfx.family, &pfx.addr, found);
+  } else {
+    rc = provider->lookup(provider, pfx.family, &pfx.addr, pfx.masklen,
+        found);
+  }
+  return (rc < 0) ? IPMETA_ERR_INTERNAL : rc;
+}
+
 inline int ipmeta_lookup(ipmeta_t *ipmeta, const char *addr_str,
                          uint32_t providermask, ipmeta_record_set_t *found)
 {

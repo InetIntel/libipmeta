@@ -58,6 +58,8 @@
 /* ipinfo */
 #include "ipmeta_provider_ipinfo.h"
 
+#include "ipmeta_provider_memcache_psql.h"
+
 #if 0
 /* netacq legacy */
 #include "ipmeta_provider_netacq.h"
@@ -80,6 +82,7 @@ static const provider_alloc_func_t provider_alloc_functions[] = {
   ipmeta_provider_netacq_edge_alloc,
   ipmeta_provider_pfx2as_alloc,
   ipmeta_provider_ipinfo_alloc,
+  ipmeta_provider_memcache_psql_alloc,
 };
 
 void ipmeta_clean_record(ipmeta_record_t *record)

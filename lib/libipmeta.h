@@ -95,8 +95,12 @@ typedef enum ipmeta_provider_id {
   /** Geolocation data from ipinfo.io */
   IPMETA_PROVIDER_IPINFO = 4,
 
+  /** Memcache instance, where cache misses result in a query to a
+   *  postgresql database */
+  IPMETA_PROVIDER_MEMCACHE_PSQL = 5,
+
   /** Highest numbered metadata provider ID */
-  IPMETA_PROVIDER_MAX = IPMETA_PROVIDER_IPINFO,
+  IPMETA_PROVIDER_MAX = IPMETA_PROVIDER_MEMCACHE_PSQL,
 
 } ipmeta_provider_id_t;
 
@@ -342,6 +346,30 @@ int ipmeta_lookup_addr(ipmeta_t *ipmeta, int family, void *addrp,
  */
 int ipmeta_lookup(ipmeta_t *ipmeta, const char *addr_str,
                   uint32_t providermask, ipmeta_record_set_t *found);
+
+/** Look up the address or prefix using a specific provider
+ *
+ *  Unlike the other lookup functions, this method will call the lookup
+ *  callbacks defined inside the provider module rather than using the
+ *  lookup callback from the datastructure.
+ *
+ *  This ensures that any provider-specific pre- or post-processing defined
+ *  within the provider module will be applied. This method is also the
+ *  only suitable option for performing lookups on providers that
+ *  do not make use of the datastructure (e.g. memcache_psql).
+ *
+ * @param ipmeta        The ipmeta instance to use for the lookup
+ * @param addr_str      Pointer to a string representation of the IPv4 or IPv6
+ *                      address or prefix to look up
+ * @param provider      The provider instance to use for the lookup
+ * @param found         Pointer to a record set to use for storing matches
+ * @return 1 if we were able to successfully find a match using the provider;
+ *         0 if no match was achieved;
+ *         IPMETA_ERR_INPUT for bad input; or IPMETA_ERR_INTERNAL
+ *         if an internal error occured.
+ */
+int ipmeta_lookup_using_provider(ipmeta_t *ipmeta, const char *addr_str,
+        ipmeta_provider_t *provider, ipmeta_record_set_t *found);
 
 /** Check if the given provider is enabled already
  *

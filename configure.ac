@@ -92,6 +92,8 @@ AC_FUNC_MALLOC
 AC_FUNC_REALLOC
 
 # Checks for libraries.
+OPTIONAL_LIBS=""
+
 # we use libwandio for threaded IO
 AC_SEARCH_LIBS([wandio_create], [wandio trace], [with_wandio=yes],
                  [AC_MSG_ERROR(
@@ -101,6 +103,19 @@ AM_CONDITIONAL([WITH_WANDIO], [test "x$with_wandio" == xyes])
 
 AC_SEARCH_LIBS([PQexec], [pq], [with_pq=yes], [with_pq=no])
 AM_CONDITIONAL([WITH_PQ], [test "x$with_pq" == xyes])
+
+if test "x$with_pq" == xyes; then
+    AC_DEFINE(HAVE_LIBPQ, 1, [Set to 1 if libpq is available])
+    OPTIONAL_LIBS="$OPTIONAL_LIBS -lpq"
+fi
+
+AC_SEARCH_LIBS([memcached_free], [memcached], [with_memcached=yes],
+        [with_memcached=no])
+
+if test "x$with_memcached" == xyes; then
+    AC_DEFINE(HAVE_LIBMEMCACHED, 1, [Set to 1 if libmemcached is available])
+    OPTIONAL_LIBS="$OPTIONAL_LIBS -lmemcached"
+fi
 
 # Checks for header files.
 AC_CHECK_HEADERS([arpa/inet.h inttypes.h limits.h math.h stdlib.h string.h \
@@ -112,11 +127,18 @@ AC_CHECK_HEADERS([arpa/inet.h inttypes.h limits.h math.h stdlib.h string.h \
 AC_HEADER_ASSERT
 
 AC_SUBST(LIBIPMETA_LIBTOOL_VERSION)
+AC_SUBST(OPTIONAL_LIBS)
 
 if test x"$with_pq" == xyes; then
-        AC_MSG_NOTICE(["Building tool load_ipmeta_into_psql_db: Yes"])
+    AC_MSG_NOTICE(["Building tool load_ipmeta_into_psql_db: Yes"])
+    if test x"$with_memcached" == xyes; then
+        AC_MSG_NOTICE(["Building functional version of memcache_psql provider: Yes"])
+    else
+        AC_MSG_NOTICE(["Building functional version of memcache_psql provider: No"])
+    fi
 else
-        AC_MSG_NOTICE(["Building tool load_ipmeta_into_psql_db: No"])
+    AC_MSG_NOTICE(["Building tool load_ipmeta_into_psql_db: No"])
+    AC_MSG_NOTICE(["Building functional version of memcache_psql provider: No"])
 fi
 
 AC_CONFIG_FILES([Makefile
