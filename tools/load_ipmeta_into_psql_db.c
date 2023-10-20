@@ -69,9 +69,8 @@
 #define BUFFER_LEN 1024
 
 const char *INSERT_IPINFO_PREFIX_SQL =
-    "INSERT INTO ipmeta_prefixes (id, prefix, source, published, location, "
-    "post_code, latitude, longitude) "
-    "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
+    "INSERT INTO ipmeta_prefixes (record_id, prefix) "
+    "VALUES ($1, $2) "
     "ON CONFLICT DO NOTHING";
 
 const char *INSERT_IPMETA_LOCATION_SQL =
@@ -82,8 +81,14 @@ const char *SELECT_IPMETA_LOCATION_SQL =
     "SELECT id FROM ipmeta_locations WHERE country_code = $1 AND "
     "continent_code = $2 AND region = $3 AND city = $4";
 
-#define INSERT_IPINFO_PREFIX_PARAM_COUNT 8
+const char *INSERT_IPMETA_RECORD_SQL =
+    "INSERT INTO ipmeta_records (source, published, "
+    "location, post_code, latitude, longitude) "
+    "VALUES ($1, $2, $3, $4, $5, $6) RETURNING id";
+
+#define INSERT_IPINFO_PREFIX_PARAM_COUNT 2
 #define INSERT_IPMETA_LOCATION_PARAM_COUNT 5
+#define INSERT_IPMETA_RECORD_PARAM_COUNT 6
 #define SELECT_IPMETA_LOCATION_PARAM_COUNT 4
 
 // convert char[2] to uint16_t
@@ -115,6 +120,7 @@ typedef struct inserter_state {
     PGconn *pgconn;
     PGresult *insert_pfx_stmt;
     PGresult *insert_loc_stmt;
+    PGresult *insert_rec_stmt;
     PGresult *select_loc_stmt;
     uint8_t psql_error;
     int trans_size;
@@ -384,6 +390,40 @@ static void parse_ipinfo_cell(void *s, size_t i, void *data) {
     state->current_column++;
 }
 
+static int64_t insert_record_into_psql(ipmeta_inserter_state_t *state,
+        int64_t loc_id) {
+    PGresult *pg_res;
+    const char *values[INSERT_IPMETA_RECORD_PARAM_COUNT];
+    int64_t retid = -1;
+
+    char longstr[32];
+    char latstr[32];
+    char loc_id_str[32];
+
+    snprintf(latstr, 32, "%.6f", state->record->latitude);
+    snprintf(longstr, 32, "%.6f", state->record->longitude);
+    snprintf(loc_id_str, 32, "%ld", loc_id);
+
+    values[0] = "ipinfo";
+    values[1] = state->timestamp_str;
+    values[2] = loc_id_str;
+    values[3] = state->record->post_code;
+    values[4] = latstr;
+    values[5] = longstr;
+
+    pg_res = PQexecPrepared(state->pgconn, "insert_record",
+            INSERT_IPMETA_RECORD_PARAM_COUNT, values, NULL, NULL, 0);
+
+    if (PQresultStatus(pg_res) == PGRES_TUPLES_OK) {
+        retid = strtoll(PQgetvalue(pg_res, 0, 0), NULL, 10);
+    } else {
+        fprintf(stderr, "Error while inserting new ipmeta record entry: %s\n",
+                        PQerrorMessage(state->pgconn));
+    }
+    PQclear(pg_res);
+    return retid;
+}
+
 static int64_t insert_location_into_psql(ipmeta_inserter_state_t *state) {
 
     PGresult *pg_res, *ins_res;
@@ -432,16 +472,13 @@ static int64_t insert_location_into_psql(ipmeta_inserter_state_t *state) {
 }
 
 static int insert_pfx_into_psql(ipmeta_inserter_state_t *state,
-        ipvx_prefix_list_t *pfx_node, int64_t loc_id) {
+        ipvx_prefix_list_t *pfx_node, int64_t rec_id) {
 
     PGresult *pg_res;
     const char *values[INSERT_IPINFO_PREFIX_PARAM_COUNT];
     char pfxstr[INET_ADDRSTRLEN + 4];
 
-    char idstr[32];
-    char loc_id_str[32];
-    char latstr[32];
-    char longstr[32];
+    char rec_id_str[32];
     int ret = 0;
 
     if (ipvx_ntop_pfx(&(pfx_node->prefix), pfxstr) == NULL) {
@@ -449,22 +486,10 @@ static int insert_pfx_into_psql(ipmeta_inserter_state_t *state,
         return -1;
     }
 
-#define rec (state->record)  /* convenient code abbreviation */
-    snprintf(idstr, 32, "%u", rec->id);
-    snprintf(loc_id_str, 32, "%ld", loc_id);
-    snprintf(latstr, 32, "%.6f", rec->latitude);
-    snprintf(longstr, 32, "%.6f", rec->longitude);
+    snprintf(rec_id_str, 32, "%ld", rec_id);
 
-
-    values[0] = idstr;
+    values[0] = rec_id_str;
     values[1] = pfxstr;
-    values[2] = "ipinfo";
-    values[3] = state->timestamp_str;
-    values[4] = loc_id_str;
-    values[5] = rec->post_code;
-    values[6] = latstr;
-    values[7] = longstr;
-#undef rec
 
     pg_res = PQexecPrepared(state->pgconn, "insert_ipmeta",
             INSERT_IPINFO_PREFIX_PARAM_COUNT, values, NULL, NULL, 0);
@@ -489,7 +514,7 @@ static void parse_ipinfo_row(int c, void *data) {
     ipmeta_inserter_state_t *state = (ipmeta_inserter_state_t *)(data);
     ipvx_prefix_list_t *pfx_list=NULL, *pfx_node;
     PGresult *pg_res;
-    int64_t loc_id;
+    int64_t loc_id, rec_id;
 
     khiter_t khiter;
 
@@ -502,7 +527,6 @@ static void parse_ipinfo_row(int c, void *data) {
         goto rowdone;
     }
 
-    check_column_count(state, LOCATION_COL_ENDCOL);
     if (state->record == NULL || state->record->id == 0) {
         //row_error(state, "%s", "Row did not produce a valid record");
         goto rowdone;
@@ -527,7 +551,7 @@ static void parse_ipinfo_row(int c, void *data) {
         goto rowdone;
     }
 
-    if (state->trans_size >= 10000) {
+    if (state->trans_size >= 10000000) {
         pg_res = PQexec(state->pgconn, "COMMIT");
         if (PQresultStatus(pg_res) != PGRES_COMMAND_OK) {
             fprintf(stderr, "Failed to commit transaction: %s\n",
@@ -559,9 +583,15 @@ static void parse_ipinfo_row(int c, void *data) {
         goto rowdone;
     }
 
+    rec_id = insert_record_into_psql(state, loc_id);
+    if (rec_id <= 0) {
+        state->psql_error = 1;
+        goto rowdone;
+    }
+
     for (pfx_node = pfx_list; pfx_node != NULL; pfx_node = pfx_node->next) {
         // do insertion here
-        if (insert_pfx_into_psql(state, pfx_node, loc_id) < 0) {
+        if (insert_pfx_into_psql(state, pfx_node, rec_id) < 0) {
             state->psql_error = 1;
             goto rowdone;
         }
@@ -632,6 +662,15 @@ static int read_ipinfo_file(ipmeta_inserter_state_t *state,
             NULL);
     if (PQresultStatus(state->insert_loc_stmt) != PGRES_COMMAND_OK) {
         fprintf(stderr, "Preparation of insert location statement failed: %s\n",
+                PQerrorMessage(state->pgconn));
+        goto end;
+    }
+
+    state->insert_rec_stmt = PQprepare(state->pgconn, "insert_record",
+            INSERT_IPMETA_RECORD_SQL, INSERT_IPMETA_RECORD_PARAM_COUNT,
+            NULL);
+    if (PQresultStatus(state->insert_rec_stmt) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "Preparation of insert record statement failed: %s\n",
                 PQerrorMessage(state->pgconn));
         goto end;
     }
@@ -720,6 +759,7 @@ end:
     csv_free(&(state->parser));
     wandio_destroy(file);
     PQclear(state->insert_pfx_stmt);
+    PQclear(state->insert_rec_stmt);
     PQclear(state->insert_loc_stmt);
     PQclear(state->select_loc_stmt);
     PQfinish(state->pgconn);
