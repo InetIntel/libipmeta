@@ -68,9 +68,21 @@ static int lookup(const char *addr_str, iow_t *outfile)
 {
   char output_prefix[BUFFER_LEN];
 
-  if (ipmeta_lookup(ipmeta, addr_str, providermask, records) < 0) {
-    fprintf(stderr, "ERROR: invalid address or prefix \"%s\"\n", addr_str);
-    return -1;
+  /* Use the provider specific function for lookups -- dirty hack
+   * intended to allow memcache_psql to be used with this tool
+   */
+  if (enabled_providers_cnt == 1) {
+    if (ipmeta_lookup_using_provider(ipmeta, addr_str, enabled_providers[0],
+          records) < 0) {
+      fprintf(stderr, "ERROR: invalid address or prefix \"%s\"\n", addr_str);
+      return -1;
+    }
+  } else {
+
+    if (ipmeta_lookup(ipmeta, addr_str, providermask, records) < 0) {
+      fprintf(stderr, "ERROR: invalid address or prefix \"%s\"\n", addr_str);
+      return -1;
+    }
   }
 
   /* look it up using each provider */
