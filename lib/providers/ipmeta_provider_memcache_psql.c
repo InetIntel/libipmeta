@@ -54,7 +54,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <math.h>
 
+#include "libcsv/csv.h"
 #include "utils.h"
 #include "ipvx_utils.h"
 
@@ -73,9 +75,38 @@
 
 #define STATE(p) (IPMETA_PROVIDER_STATE(memcache_psql, p))
 
+enum {
+    IPINFO_PSQL_COLUMN_PREFIX = 0,
+    IPINFO_PSQL_COLUMN_SOURCE = 1,
+    IPINFO_PSQL_COLUMN_PUBLISHED = 2,
+    IPINFO_PSQL_COLUMN_COUNTRY_CODE = 3,
+    IPINFO_PSQL_COLUMN_CONTINENT_CODE = 4,
+    IPINFO_PSQL_COLUMN_REGION = 5,
+    IPINFO_PSQL_COLUMN_CITY = 6,
+    IPINFO_PSQL_COLUMN_POST_CODE = 7,
+    IPINFO_PSQL_COLUMN_LATITUDE = 8,
+    IPINFO_PSQL_COLUMN_LONGITUDE = 9,
+    IPINFO_PSQL_COLUMN_TIMEZONE = 10,
+};
+
+enum {
+    IPINFO_MC_COLUMN_COUNTRY_CODE = 0,
+    IPINFO_MC_COLUMN_CONTINENT_CODE = 1,
+    IPINFO_MC_COLUMN_REGION = 2,
+    IPINFO_MC_COLUMN_CITY = 3,
+    IPINFO_MC_COLUMN_POST_CODE = 4,
+    IPINFO_MC_COLUMN_LATITUDE = 5,
+    IPINFO_MC_COLUMN_LONGITUDE = 6,
+    IPINFO_MC_COLUMN_TIMEZONE = 7,
+    IPINFO_MC_COLUMN_NUMIPS = 8,
+    IPINFO_MC_COLUMN_END
+};
+
 const char *QUERY_PFX_SQL_BASE =
-    "SELECT * FROM %s_lookup WHERE prefix::inet >>= inet $1 "
-    "ORDER BY published DESC, netmask(prefix) DESC LIMIT 1";
+    "SELECT * FROM ("
+    "    SELECT * FROM %s_lookup WHERE prefix::inet && $1::inet "
+    ") WHERE published = (SELECT MAX(published) FROM ipmeta_records) "
+    " ORDER BY prefix ASC";
 
 #define QUERY_PFX_PARAM_COUNT 1
 
@@ -98,6 +129,13 @@ typedef struct ipmeta_provider_memcache_psql_state {
     char *psql_password;
 
     char *provider;
+
+    uint8_t disable_memcache;
+    ipmeta_record_t *record;
+    ipmeta_record_set_t *lookup_results;
+    int column_num;
+    int lookup_record_cnt;
+    uint64_t lookup_ip_cnt;
 
 #ifdef HAVE_LIBPQ
     PGconn *pgconn;
@@ -332,6 +370,230 @@ void ipmeta_provider_memcache_psql_free(ipmeta_provider_t *provider) {
     free(state);
 }
 
+#ifdef HAVE_LIBPQ
+static int process_psql_row_ipinfo(PGresult *pg_res, int row_id, int cols,
+        ipmeta_record_t *rec, uint64_t *numips) {
+
+    char *value;
+    int i;
+    ipvx_prefix_t pfx;
+
+    if (rec == NULL) {
+        ipmeta_log(__func__,
+                "NULL record provided, cannot populate from database row");
+        return -1;
+    }
+
+    if (pg_res == NULL) {
+        ipmeta_log(__func__,
+                "NULL query result provided, cannot parse row %d", row_id);
+        return -1;
+    }
+
+    for (i = 0; i < cols; i++) {
+        value = PQgetvalue(pg_res, row_id, i);
+
+        switch(i) {
+        case IPINFO_PSQL_COLUMN_PREFIX:
+            if (ipvx_pton_pfx(value, &pfx) < 0) {
+                ipmeta_log(__func__,
+                    "invalid prefix returned by PSQL query: %s", value);
+                return -1;
+            }
+            if (pfx.family == AF_INET) {
+                *numips = pow(2, (32 - pfx.masklen));
+            } else if (pfx.family == AF_INET6) {
+                *numips = pow(2, (128 - pfx.masklen));
+            } else {
+                *numips = 0;
+            }
+            break;
+        case IPINFO_PSQL_COLUMN_SOURCE:
+            rec->source = IPMETA_PROVIDER_MEMCACHE_PSQL;
+            break;
+        case IPINFO_PSQL_COLUMN_PUBLISHED:
+            // not included in the record, so skip
+            break;
+        case IPINFO_PSQL_COLUMN_COUNTRY_CODE:
+            strncpy(rec->country_code, value, 2);
+            break;
+        case IPINFO_PSQL_COLUMN_CONTINENT_CODE:
+            strncpy(rec->continent_code, value, 2);
+            break;
+        case IPINFO_PSQL_COLUMN_REGION:
+            rec->region = strdup(value);
+            break;
+        case IPINFO_PSQL_COLUMN_CITY:
+            rec->city = strdup(value);
+            break;
+        case IPINFO_PSQL_COLUMN_POST_CODE:
+            rec->post_code = strdup(value);
+            break;
+        case IPINFO_PSQL_COLUMN_LATITUDE:
+            rec->latitude = strtod(value, NULL);
+            break;
+        case IPINFO_PSQL_COLUMN_LONGITUDE:
+            rec->longitude = strtod(value, NULL);
+            break;
+        case IPINFO_PSQL_COLUMN_TIMEZONE:
+            rec->timezone = strdup(value);
+            break;
+        default:
+            ipmeta_log(__func__,
+                "unexpected number of columns returned by PSQL query: %d", cols);
+            return -1;
+        }
+    }
+    return 0;
+
+}
+#endif
+
+static void parse_memcached_cell(void *s, size_t i, void *data) {
+    ipmeta_provider_memcache_psql_state_t *state;
+    char *tok = (char *)s;
+
+    state = (ipmeta_provider_memcache_psql_state_t *)data;
+
+    if (state->record == NULL) {
+        state->record = calloc(1, sizeof(ipmeta_record_t));
+    }
+
+    switch(state->column_num) {
+        case IPINFO_MC_COLUMN_COUNTRY_CODE:
+            strncpy(state->record->country_code, tok, 2);
+            break;
+        case IPINFO_MC_COLUMN_CONTINENT_CODE:
+            strncpy(state->record->continent_code, tok, 2);
+            break;
+        case IPINFO_MC_COLUMN_REGION:
+            state->record->region = strdup(tok);
+            break;
+        case IPINFO_MC_COLUMN_CITY:
+            state->record->city = strdup(tok);
+            break;
+        case IPINFO_MC_COLUMN_POST_CODE:
+            state->record->post_code = strdup(tok);
+            break;
+        case IPINFO_MC_COLUMN_LATITUDE:
+            state->record->latitude = strtod(tok, NULL);
+            break;
+        case IPINFO_MC_COLUMN_LONGITUDE:
+            state->record->longitude = strtod(tok, NULL);
+            break;
+        case IPINFO_MC_COLUMN_TIMEZONE:
+            state->record->timezone = strdup(tok);
+            break;
+        case IPINFO_MC_COLUMN_NUMIPS:
+            state->lookup_ip_cnt = strtol(tok, NULL, 10);
+            break;
+        default:
+            ipmeta_log(__func__, "Unexpected trailing column %d in memcached prefix data: %s", state->column_num, tok);
+            return;
+    }
+
+    state->column_num += 1;
+}
+
+static void parse_memcached_row(int c, void *data) {
+    ipmeta_provider_memcache_psql_state_t *state;
+    state = (ipmeta_provider_memcache_psql_state_t *)data;
+
+    if (state->record == NULL) {
+        return;
+    }
+
+
+    if (state->column_num != IPINFO_MC_COLUMN_END) {
+        ipmeta_log(__func__, "Unexpected number of columns in memcached prefix data: %d\n", state->column_num);
+        return;
+    }
+
+    if (state->lookup_results == NULL) {
+        ipmeta_clean_record(state->record);
+    }
+
+    state->record->source = IPMETA_PROVIDER_MEMCACHE_PSQL;
+    if (ipmeta_record_set_add_record(state->lookup_results, state->record,
+                state->lookup_ip_cnt) != 0) {
+        return;
+    }
+
+    state->record = NULL;
+    state->lookup_record_cnt += 1;
+    state->column_num = 0;
+}
+
+
+#if HAVE_LIBMEMCACHED
+static int memcache_lookup(ipmeta_provider_memcache_psql_state_t *state,
+        char *tofind, char *first_key, ipmeta_record_set_t *records,
+        int *rec_count) {
+
+    char mc_key[1024];
+    char *value;
+    int pfx_cnt, i;
+    memcached_return_t rc;
+    size_t vallen;
+    uint32_t flags;
+    ipmeta_record_t *rec;
+    struct csv_parser csvp;
+
+    if (state->disable_memcache) {
+        return 0;
+    }
+
+    value = memcached_get(state->mc_hdl, first_key, strlen(first_key),
+        &vallen, &flags, &rc);
+    if (rc == MEMCACHED_NOTFOUND) {
+        return 0;
+    }
+    if (rc != MEMCACHED_SUCCESS) {
+        return -1;
+    }
+
+    pfx_cnt = (int) strtol(value, NULL, 10);
+    free(value);
+    if (pfx_cnt == 0) {
+        return 0;
+    }
+
+    csv_init(&csvp, CSV_STRICT | CSV_REPALL_NL | CSV_STRICT_FINI |
+            CSV_APPEND_NULL | CSV_EMPTY_IS_NULL);
+    state->lookup_record_cnt = 0;
+    state->lookup_ip_cnt = 0;
+    state->lookup_results = records;
+    state->column_num = 0;
+
+    for (i = 0; i < pfx_cnt; i++) {
+        snprintf(mc_key, 1024, "ipmeta_ipinfo_pfx_%s_%d", tofind, i);
+        value = memcached_get(state->mc_hdl, mc_key, strlen(mc_key),
+                &vallen, &flags, &rc);
+        if (csv_parse(&csvp, value, vallen, parse_memcached_cell,
+                parse_memcached_row, state) != (int) vallen) {
+            ipmeta_log(__func__, "CSV parsing error: %s",
+                    csv_strerror(csv_error(&csvp)));
+            state->lookup_results = NULL;
+            free(value);
+            csv_free(&csvp);
+            return -1;
+        }
+        free(value);
+    }
+    if (csv_fini(&csvp, parse_memcached_cell, parse_memcached_row, state) != 0) {
+        ipmeta_log(__func__, "CSV parsing error: %s",
+                csv_strerror(csv_error(&csvp)));
+        state->lookup_results = NULL;
+        csv_free(&csvp);
+        return -1;
+    }
+    *rec_count = state->lookup_record_cnt;
+    state->lookup_results = NULL;
+    csv_free(&csvp);
+    return *rec_count;
+}
+#endif
+
 #define family_size(fam) \
     ((fam) == AF_INET6 ? sizeof(struct in6_addr) : sizeof(struct in_addr))
 
@@ -340,19 +602,40 @@ static int lookup_prefix(ipmeta_provider_memcache_psql_state_t *state,
 
 #ifdef HAVE_LIBPQ
 #ifdef HAVE_LIBMEMCACHED
+    const char *params[QUERY_PFX_PARAM_COUNT];
     char tofind[INET6_ADDRSTRLEN + 4];
     PGresult *pg_res;
-    int cols = 0, i;
+    int rows = 0, r, cols, mc_res;
     ipmeta_record_t *rec;
-    char *value;
+    int rec_count = 0;
+    uint64_t numips = 0;
+    char mc_key[1024];
+    char cache_str[4096];
+    char row_cnt_str[32];
+    int nocache = 0;
+    memcached_return_t rc;
 
     if (ipvx_ntop_pfx(pfx, tofind) == NULL) {
         return IPMETA_ERR_INPUT;
     }
 
+    snprintf(mc_key, 1024, "ipmeta_ipinfo_pfxcnt_%s", tofind);
+
+    mc_res = memcache_lookup(state, tofind, mc_key, records, &rec_count);
+    if (mc_res < 0) {
+        ipmeta_log(__func__,
+                "Error during memcached lookup for %s, falling back to DB",
+                tofind);
+        state->disable_memcache = 1;
+    }
+    if (mc_res > 0) {
+        return rec_count;
+    }
+
+    params[0] = tofind;
 
     pg_res = PQexecPrepared(state->pgconn, "query_pfx_stmt",
-            QUERY_PFX_PARAM_COUNT, (const char **)(&tofind), NULL, NULL, 0);
+            QUERY_PFX_PARAM_COUNT, params, NULL, NULL, 0);
     if (PQntuples(pg_res) < 0) {
         ipmeta_log(__func__, "ERROR: querying postgresql for prefix %s -- %s",
                 tofind, PQerrorMessage(state->pgconn));
@@ -360,23 +643,69 @@ static int lookup_prefix(ipmeta_provider_memcache_psql_state_t *state,
         return IPMETA_ERR_INTERNAL;
     }
 
+
     cols = PQnfields(pg_res);
-    if (PQntuples(pg_res) > 0) {
+    rows = PQntuples(pg_res);
+
+    if (rows <= 0) {
+        return 0;
+    }
+
+    if (state->disable_memcache == 0) {
+        snprintf(row_cnt_str, 32, "%d", rows);
+        rc = memcached_set(state->mc_hdl, mc_key, strlen(mc_key),
+            row_cnt_str, strlen(row_cnt_str), 24 * 60 * 60, 0);
+        if (rc != MEMCACHED_SUCCESS) {
+            ipmeta_log(__func__, "Unable to cache SQL query result for %s",
+                    tofind);
+            nocache = 1;
+        }
+    }
+
+    for (r = 0; r < rows; r++) {
         rec = calloc(1, sizeof(ipmeta_record_t));
-    } else {
-        rec = NULL;
-    }
 
-    for (i = 0; i < PQnfields(pg_res); i++) {
-        value = PQgetvalue(pg_res, 0, i);
-    }
+        /* TODO make this more generic, use function pointers from the
+         * provider itself... */
+        if (strcmp(state->provider, "ipinfo") == 0) {
+            if (process_psql_row_ipinfo(pg_res, r, cols, rec, &numips) < 0) {
+                ipmeta_free_record(rec);
+                rec_count = -1;
+                break;
+            }
+        }
 
+        if (ipmeta_record_set_add_record(records, rec, numips) != 0) {
+            ipmeta_free_record(rec);
+            rec_count = -1;
+            break;
+        }
+
+        if (state->disable_memcache == 0 && nocache == 0) {
+            snprintf(mc_key, 1024, "ipmeta_ipinfo_pfx_%s_%d", tofind, r);
+            /* Add individual record to memcache */
+            snprintf(cache_str, 4096, "%s,%s,%s,%s,%s,%.6f,%.6f,%s,%lu\n",
+                    rec->country_code, rec->continent_code, rec->region,
+                    rec->city, rec->post_code, rec->latitude, rec->longitude,
+                    rec->timezone, numips);
+
+            rc = memcached_set(state->mc_hdl, mc_key, strlen(mc_key), cache_str,
+                    strlen(cache_str), 24 * 60 * 60, 0);
+            if (rc != MEMCACHED_SUCCESS) {
+                ipmeta_log(__func__, "Unable to cache SQL query result for %s",
+                        tofind);
+                nocache = 1;
+            }
+        }
+
+        rec_count += 1;
+    }
     PQclear(pg_res);
 
 #endif /* HAVE_LIBMEMCACHED */
 #endif /* HAVE_LIBPQ */
 
-    return 0;
+    return rec_count;
 }
 
 int ipmeta_provider_memcache_psql_lookup_pfx(ipmeta_provider_t *provider,
