@@ -81,6 +81,9 @@ struct ipmeta_record_set {
 
   size_t _cursor;
   size_t _alloc_size;
+
+  uint8_t mustfree; // if set, the records must be freed when the record
+                    // set is cleared
 };
 
 /** @} */
@@ -102,8 +105,21 @@ int ipmeta_record_set_add_record(ipmeta_record_set_t *record_set,
  *
  * @param record_set    The record set instance to clear the records for
  *
- * @note this function does not actually destroy any memory.
+ * @note this function does not actually destroy any memory, unless
+ * ipmeta_record_set_require_free() has been called beforehand.
  */
 void ipmeta_record_set_clear(ipmeta_record_set_t *record_set);
+
+/** Marks the records stored in this set as being "owned" by the
+ *  record set, and therefore they must be freed whenever the record
+ *  set is cleared or destroyed.
+ *
+ * @param record_set    The record set whose records must be freed eventually.
+ *
+ * @note the "must free" flag is reset to "false" whenever the record set
+ * is cleared, so you should call this anytime you are populating a record
+ * set with records that must be freed later on.
+ */
+void ipmeta_record_set_require_free(ipmeta_record_set_t *record_set);
 
 #endif /* __LIBIPMETA_INT_H */
