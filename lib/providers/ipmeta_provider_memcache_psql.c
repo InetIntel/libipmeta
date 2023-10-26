@@ -109,6 +109,8 @@ const char *QUERY_PFX_SQL_BASE =
     " ORDER BY prefix ASC";
 
 #define QUERY_PFX_PARAM_COUNT 1
+#define MAX_CACHE_SIZE (1024 * 1024 * 10)
+#define MORE_CACHED_FLAG "MORE..."
 
 static ipmeta_provider_t ipmeta_provider_memcache_psql = {
     IPMETA_PROVIDER_MEMCACHE_PSQL, PROVIDER_NAME,
@@ -131,11 +133,14 @@ typedef struct ipmeta_provider_memcache_psql_state {
     char *provider;
 
     uint8_t disable_memcache;
+    uint8_t more_cached_records;
     ipmeta_record_t *record;
     ipmeta_record_set_t *lookup_results;
     int column_num;
     int lookup_record_cnt;
     uint64_t lookup_ip_cnt;
+
+    char *accum_cache;
 
 #ifdef HAVE_LIBPQ
     PGconn *pgconn;
@@ -340,6 +345,10 @@ void ipmeta_provider_memcache_psql_free(ipmeta_provider_t *provider) {
     }
 #endif
 
+    if (state->accum_cache) {
+        free(state->accum_cache);
+    }
+
     if (state->provider) {
         free(state->provider);
     }
@@ -449,6 +458,7 @@ static int process_psql_row_ipinfo(PGresult *pg_res, int row_id, int cols,
 }
 #endif
 
+
 static void parse_memcached_cell(void *s, size_t i, void *data) {
     ipmeta_provider_memcache_psql_state_t *state;
     char *tok = (char *)s;
@@ -461,6 +471,11 @@ static void parse_memcached_cell(void *s, size_t i, void *data) {
 
     switch(state->column_num) {
         case IPINFO_MC_COLUMN_COUNTRY_CODE:
+            if (strcmp(MORE_CACHED_FLAG, tok) == 0) {
+                /* flag to indicate we need to move on to the next page */
+                state->more_cached_records = 1;
+                break;
+            }
             strncpy(state->record->country_code, tok, 2);
             break;
         case IPINFO_MC_COLUMN_CONTINENT_CODE:
@@ -503,6 +518,10 @@ static void parse_memcached_row(int c, void *data) {
         return;
     }
 
+    /* We've hit the "MORE..." flag, so ignore this (final) row */
+    if (state->more_cached_records) {
+        return;
+    }
 
     if (state->column_num != IPINFO_MC_COLUMN_END) {
         ipmeta_log(__func__, "Unexpected number of columns in memcached prefix data: %d\n", state->column_num);
@@ -527,8 +546,8 @@ static void parse_memcached_row(int c, void *data) {
 
 #if HAVE_LIBMEMCACHED
 static int memcache_lookup(ipmeta_provider_memcache_psql_state_t *state,
-        char *tofind, char *first_key, ipmeta_record_set_t *records,
-        int *rec_count) {
+        char *tofind, uint32_t page,
+        ipmeta_record_set_t *records, int *rec_count) {
 
     char mc_key[1024];
     char *value;
@@ -543,19 +562,16 @@ static int memcache_lookup(ipmeta_provider_memcache_psql_state_t *state,
         return 0;
     }
 
-    value = memcached_get(state->mc_hdl, first_key, strlen(first_key),
+    state->more_cached_records = 0;
+    snprintf(mc_key, 1024, "ipmeta_ipinfo_%s_page_%u", tofind, page);
+
+    value = memcached_get(state->mc_hdl, mc_key, strlen(mc_key),
         &vallen, &flags, &rc);
     if (rc == MEMCACHED_NOTFOUND) {
         return 0;
     }
     if (rc != MEMCACHED_SUCCESS) {
         return -1;
-    }
-
-    pfx_cnt = (int) strtol(value, NULL, 10);
-    free(value);
-    if (pfx_cnt == 0) {
-        return 0;
     }
 
     csv_init(&csvp, CSV_STRICT | CSV_REPALL_NL | CSV_STRICT_FINI |
@@ -565,21 +581,16 @@ static int memcache_lookup(ipmeta_provider_memcache_psql_state_t *state,
     state->lookup_results = records;
     state->column_num = 0;
 
-    for (i = 0; i < pfx_cnt; i++) {
-        snprintf(mc_key, 1024, "ipmeta_ipinfo_pfx_%s_%d", tofind, i);
-        value = memcached_get(state->mc_hdl, mc_key, strlen(mc_key),
-                &vallen, &flags, &rc);
-        if (csv_parse(&csvp, value, vallen, parse_memcached_cell,
-                parse_memcached_row, state) != (int) vallen) {
+    if (csv_parse(&csvp, value, vallen, parse_memcached_cell,
+                            parse_memcached_row, state) != (int) vallen) {
             ipmeta_log(__func__, "CSV parsing error: %s",
-                    csv_strerror(csv_error(&csvp)));
+                            csv_strerror(csv_error(&csvp)));
             state->lookup_results = NULL;
             free(value);
             csv_free(&csvp);
             return -1;
-        }
-        free(value);
     }
+    free(value);
     if (csv_fini(&csvp, parse_memcached_cell, parse_memcached_row, state) != 0) {
         ipmeta_log(__func__, "CSV parsing error: %s",
                 csv_strerror(csv_error(&csvp)));
@@ -597,6 +608,7 @@ static int memcache_lookup(ipmeta_provider_memcache_psql_state_t *state,
 #define family_size(fam) \
     ((fam) == AF_INET6 ? sizeof(struct in6_addr) : sizeof(struct in_addr))
 
+
 static int lookup_prefix(ipmeta_provider_memcache_psql_state_t *state,
         ipvx_prefix_t *pfx, ipmeta_record_set_t *records) {
 
@@ -611,24 +623,35 @@ static int lookup_prefix(ipmeta_provider_memcache_psql_state_t *state,
     uint64_t numips = 0;
     char mc_key[1024];
     char cache_str[4096];
-    char row_cnt_str[32];
     int nocache = 0;
     memcached_return_t rc;
+
+    uint32_t page = 1;
+    int cache_used = 0;
 
     if (ipvx_ntop_pfx(pfx, tofind) == NULL) {
         return IPMETA_ERR_INPUT;
     }
 
-    snprintf(mc_key, 1024, "ipmeta_ipinfo_pfxcnt_%s", tofind);
+    ipmeta_record_set_require_free(records);
 
-    mc_res = memcache_lookup(state, tofind, mc_key, records, &rec_count);
-    if (mc_res < 0) {
-        ipmeta_log(__func__,
-                "Error during memcached lookup for %s, falling back to DB",
-                tofind);
-        state->disable_memcache = 1;
-    }
-    if (mc_res > 0) {
+    do {
+        mc_res = memcache_lookup(state, tofind, page, records, &rec_count);
+        if (mc_res < 0) {
+            ipmeta_log(__func__,
+                    "Error during memcached lookup for %s:%u, using DB instead",
+                    tofind, page);
+            state->disable_memcache = 1;
+        }
+
+        if (mc_res == 0) {
+            break;
+        }
+        page ++;
+    } while (state->more_cached_records);
+
+
+    if (rec_count > 0) {
         return rec_count;
     }
 
@@ -651,15 +674,9 @@ static int lookup_prefix(ipmeta_provider_memcache_psql_state_t *state,
         return 0;
     }
 
-    if (state->disable_memcache == 0) {
-        snprintf(row_cnt_str, 32, "%d", rows);
-        rc = memcached_set(state->mc_hdl, mc_key, strlen(mc_key),
-            row_cnt_str, strlen(row_cnt_str), 24 * 60 * 60, 0);
-        if (rc != MEMCACHED_SUCCESS) {
-            ipmeta_log(__func__, "Unable to cache SQL query result for %s",
-                    tofind);
-            nocache = 1;
-        }
+    page = 1;
+    if (state->accum_cache == NULL) {
+        state->accum_cache = calloc(MAX_CACHE_SIZE, sizeof(char));
     }
 
     for (r = 0; r < rows; r++) {
@@ -682,24 +699,56 @@ static int lookup_prefix(ipmeta_provider_memcache_psql_state_t *state,
         }
 
         if (state->disable_memcache == 0 && nocache == 0) {
-            snprintf(mc_key, 1024, "ipmeta_ipinfo_pfx_%s_%d", tofind, r);
+            int add_len = 0;
             /* Add individual record to memcache */
             snprintf(cache_str, 4096, "%s,%s,%s,%s,%s,%.6f,%.6f,%s,%lu\n",
                     rec->country_code, rec->continent_code, rec->region,
                     rec->city, rec->post_code, rec->latitude, rec->longitude,
                     rec->timezone, numips);
 
-            rc = memcached_set(state->mc_hdl, mc_key, strlen(mc_key), cache_str,
-                    strlen(cache_str), 24 * 60 * 60, 0);
-            if (rc != MEMCACHED_SUCCESS) {
-                ipmeta_log(__func__, "Unable to cache SQL query result for %s",
-                        tofind);
-                nocache = 1;
+            add_len = strlen(cache_str);
+            /* +2 because we need a \n and a \0 after the more flag */
+            if (MAX_CACHE_SIZE - cache_used < add_len +
+                        strlen(MORE_CACHED_FLAG) + 2) {
+                strncpy(state->accum_cache + cache_used, MORE_CACHED_FLAG,
+                        strlen(MORE_CACHED_FLAG));
+                cache_used += strlen(MORE_CACHED_FLAG);
+                state->accum_cache[cache_used] = '\n';
+                state->accum_cache[cache_used + 1] = '\0';
+                cache_used ++;
+
+                snprintf(mc_key, 1024, "ipmeta_ipinfo_%s_page_%u", tofind,
+                        page);
+                rc = memcached_set(state->mc_hdl, mc_key, strlen(mc_key),
+                        state->accum_cache, cache_used, 24 * 60 * 60, 0);
+                if (rc != MEMCACHED_SUCCESS) {
+                    ipmeta_log(__func__,
+                            "Unable to cache SQL query result for %s:%u",
+                            tofind, page);
+                    nocache = 1;
+                }
+                page ++;
+                cache_used = 0;
             }
+            strncpy(state->accum_cache + cache_used, cache_str, add_len);
+            cache_used += add_len;
         }
 
         rec_count += 1;
     }
+
+    if (rec_count > 0 && cache_used > 0) {
+        snprintf(mc_key, 1024, "ipmeta_ipinfo_%s_page_%u", tofind, page);
+        rc = memcached_set(state->mc_hdl, mc_key, strlen(mc_key),
+                        state->accum_cache, cache_used, 24 * 60 * 60, 0);
+        if (rc != MEMCACHED_SUCCESS) {
+            ipmeta_log(__func__,
+                    "Unable to cache SQL query result for %s:%u",
+                    tofind, page);
+            nocache = 1;
+        }
+    }
+
     PQclear(pg_res);
 
 #endif /* HAVE_LIBMEMCACHED */
