@@ -1,3 +1,14 @@
+libipmeta2 (3.3.0) unstable; urgency=medium
+
+  * Added support for ipinfo geo-location data -- note that ipinfo
+    has a MUCH larger memory footprint than other geo-providers.
+  * Added a provider that can query a postgresql database for IPmeta
+    data. It will also cache any query results into a local memcached
+    instance, so prefix lookups that occur regularly will not require
+    a database query more than ~once per day.
+
+ -- Shane Alcock <shane@alcock.co.nz>  Mon, 30 Oct 2023 13:30:14 +1300
+
 libipmeta2 (3.2.0) unstable; urgency=medium
 
   * Various code tidy-ups, no functionality has changed.

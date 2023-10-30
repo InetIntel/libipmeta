@@ -2,7 +2,7 @@ Source: libipmeta2
 Section: libs
 Priority: optional
 Maintainer: CAIDA Software Maintainer <software@caida.org>
-Build-Depends: debhelper (>= 10), autotools-dev,
+Build-Depends: debhelper (>= 10), autotools-dev, libpq-dev, libmemcached-dev,
  libwandio1-dev (>=4.2.0)
 Standards-Version: 4.1.2
 Homepage: https://github.com/CAIDA/libipmeta
@@ -32,7 +32,7 @@ Description: Command line tools for performing IP annotation using libipmeta
 Package: libipmeta2
 Architecture: any
 Section: libs
-Depends: libwandio1 (>=4.2.0), ${shlibs:Depends}, ${misc:Depends}
+Depends: libwandio1 (>=4.2.0), memcached, ${shlibs:Depends}, ${misc:Depends}
 Description: High-performance library for performing IP-metadata tagging
  libIPMeta: High-performance library for performing IP-metadata tagging.
  Includes support for Maxmind and Net Acuity geolocation as well as
