@@ -55,6 +55,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <math.h>
+#include <time.h>
 
 #include "libcsv/csv.h"
 #include "utils.h"
@@ -141,6 +142,9 @@ typedef struct ipmeta_provider_memcache_psql_state {
     uint64_t lookup_ip_cnt;
 
     char *accum_cache;
+
+    uint32_t cache_hits;
+    uint32_t cache_misses;
 
 #ifdef HAVE_LIBPQ
     PGconn *pgconn;
@@ -307,18 +311,13 @@ int ipmeta_provider_memcache_psql_init(ipmeta_provider_t *provider, int argc,
         return -1;
     }
 
-    if (connect_pgsql(state) == -1) {
-        ipmeta_log(__func__,
-                "failed to connect to postgresql database");
-        return -1;
-    }
-
     if (setup_memcached(state) == -1) {
         ipmeta_log(__func__,
                 "failed to setup memcached instance");
         return -1;
     }
 
+    srand(time(NULL));
     return 0;
 }
 
@@ -328,6 +327,10 @@ void ipmeta_provider_memcache_psql_free(ipmeta_provider_t *provider) {
     if (state == NULL) {
         return;
     }
+
+    ipmeta_log(__func__,
+            "Total cache hits: %u      Total cache misses: %u",
+            state->cache_hits, state->cache_misses);
 
 #ifdef HAVE_LIBMEMCACHED
     if (state->mc_hdl) {
@@ -568,11 +571,14 @@ static int memcache_lookup(ipmeta_provider_memcache_psql_state_t *state,
     value = memcached_get(state->mc_hdl, mc_key, strlen(mc_key),
         &vallen, &flags, &rc);
     if (rc == MEMCACHED_NOTFOUND) {
+        state->cache_misses ++;
         return 0;
     }
     if (rc != MEMCACHED_SUCCESS) {
         return -1;
     }
+
+    state->cache_hits ++;
 
     csv_init(&csvp, CSV_STRICT | CSV_REPALL_NL | CSV_STRICT_FINI |
             CSV_APPEND_NULL | CSV_EMPTY_IS_NULL);
@@ -583,7 +589,7 @@ static int memcache_lookup(ipmeta_provider_memcache_psql_state_t *state,
 
     if (csv_parse(&csvp, value, vallen, parse_memcached_cell,
                             parse_memcached_row, state) != (int) vallen) {
-            ipmeta_log(__func__, "CSV parsing error: %s",
+            ipmeta_log("memcache_psql", "CSV parsing error: %s",
                             csv_strerror(csv_error(&csvp)));
             state->lookup_results = NULL;
             free(value);
@@ -628,6 +634,7 @@ static int lookup_prefix(ipmeta_provider_memcache_psql_state_t *state,
 
     uint32_t page = 1;
     int cache_used = 0;
+    int expire_offset;
 
     if (ipvx_ntop_pfx(pfx, tofind) == NULL) {
         return IPMETA_ERR_INPUT;
@@ -655,6 +662,12 @@ static int lookup_prefix(ipmeta_provider_memcache_psql_state_t *state,
         return rec_count;
     }
 
+    if (state->pgconn == NULL && connect_pgsql(state) == -1) {
+        ipmeta_log(__func__,
+                "failed to connect to postgresql database");
+        return -1;
+    }
+
     params[0] = tofind;
 
     pg_res = PQexecPrepared(state->pgconn, "query_pfx_stmt",
@@ -678,6 +691,11 @@ static int lookup_prefix(ipmeta_provider_memcache_psql_state_t *state,
     if (state->accum_cache == NULL) {
         state->accum_cache = calloc(MAX_CACHE_SIZE, sizeof(char));
     }
+
+    /* Set cache expiry time to a random 5 minute interval ranging between 22
+     * and 26 hours, so our cache entries don't all expire at the same time
+     */
+    expire_offset = 5 * (rand() % 48);
 
     for (r = 0; r < rows; r++) {
         rec = calloc(1, sizeof(ipmeta_record_t));
@@ -720,7 +738,8 @@ static int lookup_prefix(ipmeta_provider_memcache_psql_state_t *state,
                 snprintf(mc_key, 1024, "ipmeta_ipinfo_%s_page_%u", tofind,
                         page);
                 rc = memcached_set(state->mc_hdl, mc_key, strlen(mc_key),
-                        state->accum_cache, cache_used, 24 * 60 * 60, 0);
+                        state->accum_cache, cache_used,
+                        22 * 60 * 60 + expire_offset, 0);
                 if (rc != MEMCACHED_SUCCESS) {
                     ipmeta_log(__func__,
                             "Unable to cache SQL query result for %s:%u",
@@ -740,7 +759,8 @@ static int lookup_prefix(ipmeta_provider_memcache_psql_state_t *state,
     if (rec_count > 0 && cache_used > 0) {
         snprintf(mc_key, 1024, "ipmeta_ipinfo_%s_page_%u", tofind, page);
         rc = memcached_set(state->mc_hdl, mc_key, strlen(mc_key),
-                        state->accum_cache, cache_used, 24 * 60 * 60, 0);
+                        state->accum_cache, cache_used,
+                        22 * 60 * 60 + expire_offset, 0);
         if (rc != MEMCACHED_SUCCESS) {
             ipmeta_log(__func__,
                     "Unable to cache SQL query result for %s:%u",
