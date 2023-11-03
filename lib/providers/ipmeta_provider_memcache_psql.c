@@ -152,6 +152,23 @@ typedef struct ipmeta_provider_memcache_psql_state {
 #endif
 } ipmeta_provider_memcache_psql_state_t;
 
+static inline char *sanitize(char *orig) {
+    char *repl = calloc(strlen(orig) + 1, sizeof(char));
+    char *r, *w;
+
+    r = orig; w = repl;
+
+    while (*r) {
+        if (*r == ',') {
+            r++;
+            continue;
+        }
+        *w = *r;
+        r++; w++;
+    }
+    return repl;
+}
+
 static void usage(void) {
     fprintf(stderr,
         "Usage: %s [ <arguments> ]\n"
@@ -433,10 +450,18 @@ static int process_psql_row_ipinfo(PGresult *pg_res, int row_id, int cols,
             strncpy(rec->continent_code, value, 2);
             break;
         case IPINFO_PSQL_COLUMN_REGION:
-            rec->region = strdup(value);
+            if (strchr(value, ',') == NULL) {
+                rec->region = strdup(value);
+            } else {
+                rec->region = sanitize(value);
+            }
             break;
         case IPINFO_PSQL_COLUMN_CITY:
-            rec->city = strdup(value);
+            if (strchr(value, ',') == NULL) {
+                rec->city = strdup(value);
+            } else {
+                rec->city = sanitize(value);
+            }
             break;
         case IPINFO_PSQL_COLUMN_POST_CODE:
             rec->post_code = strdup(value);
@@ -468,8 +493,15 @@ static void parse_memcached_cell(void *s, size_t i, void *data) {
 
     state = (ipmeta_provider_memcache_psql_state_t *)data;
 
+    if (tok == NULL) {
+        state->column_num += 1;
+        return;
+    }
+
     if (state->record == NULL) {
         state->record = calloc(1, sizeof(ipmeta_record_t));
+        strncpy(state->record->country_code, "??", 2);
+        strncpy(state->record->continent_code, "??", 2);
     }
 
     switch(state->column_num) {
@@ -562,6 +594,7 @@ static int memcache_lookup(ipmeta_provider_memcache_psql_state_t *state,
     struct csv_parser csvp;
 
     if (state->disable_memcache) {
+        state->cache_misses ++;
         return 0;
     }
 
@@ -575,6 +608,7 @@ static int memcache_lookup(ipmeta_provider_memcache_psql_state_t *state,
         return 0;
     }
     if (rc != MEMCACHED_SUCCESS) {
+        state->cache_misses ++;
         return -1;
     }
 
@@ -614,8 +648,34 @@ static int memcache_lookup(ipmeta_provider_memcache_psql_state_t *state,
 #define family_size(fam) \
     ((fam) == AF_INET6 ? sizeof(struct in6_addr) : sizeof(struct in_addr))
 
+static ipmeta_record_t *generate_unknown_record(
+        ipmeta_provider_t *provider,
+        ipmeta_provider_memcache_psql_state_t *state, ipvx_prefix_t *pfx,
+        uint64_t *numips) {
 
-static int lookup_prefix(ipmeta_provider_memcache_psql_state_t *state,
+    ipmeta_record_t *rec;
+
+    rec = calloc(1, sizeof(ipmeta_record_t));
+    rec->id = 0;
+    rec->source = ipmeta_get_provider_id(provider);
+    strncpy(rec->country_code, "??", 2);
+    strncpy(rec->continent_code, "??", 2);
+    rec->latitude = -100;   // deliberately invalid
+    rec->longitude = -200;  // deliberately invalid;
+
+    if (pfx->family == AF_INET) {
+        *numips = pow(2, (32 - pfx->masklen));
+    } else if (pfx->family == AF_INET6) {
+        *numips = pow(2, (128 - pfx->masklen));
+    } else {
+        *numips = 0;
+    }
+    return rec;
+}
+
+
+static int lookup_prefix(ipmeta_provider_t *provider,
+        ipmeta_provider_memcache_psql_state_t *state,
         ipvx_prefix_t *pfx, ipmeta_record_set_t *records) {
 
 #ifdef HAVE_LIBPQ
@@ -649,6 +709,7 @@ static int lookup_prefix(ipmeta_provider_memcache_psql_state_t *state,
                     "Error during memcached lookup for %s:%u, using DB instead",
                     tofind, page);
             state->disable_memcache = 1;
+            break;
         }
 
         if (mc_res == 0) {
@@ -774,6 +835,15 @@ static int lookup_prefix(ipmeta_provider_memcache_psql_state_t *state,
 #endif /* HAVE_LIBMEMCACHED */
 #endif /* HAVE_LIBPQ */
 
+    if (rec_count == 0) {
+        rec = generate_unknown_record(provider, state, pfx, &numips);
+        if (ipmeta_record_set_add_record(records, rec, numips) != 0) {
+            ipmeta_free_record(rec);
+            return -1;
+        }
+        rec_count = 1;
+    }
+
     return rec_count;
 }
 
@@ -790,7 +860,7 @@ int ipmeta_provider_memcache_psql_lookup_pfx(ipmeta_provider_t *provider,
     pfx.masklen = pfxlen;
     memcpy(&pfx.addr, (uint8_t *)addrp, family_size(family));
 
-    return lookup_prefix(state, &pfx, records);
+    return lookup_prefix(provider, state, &pfx, records);
 }
 
 int ipmeta_provider_memcache_psql_lookup_addr(ipmeta_provider_t *provider,
@@ -810,6 +880,6 @@ int ipmeta_provider_memcache_psql_lookup_addr(ipmeta_provider_t *provider,
     }
     memcpy(&pfx.addr, (uint8_t *)addrp, family_size(family));
 
-    return lookup_prefix(state, &pfx, found);
+    return lookup_prefix(provider, state, &pfx, found);
 }
 
