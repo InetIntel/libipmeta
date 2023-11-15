@@ -803,8 +803,9 @@ static int lookup_prefix(ipmeta_provider_t *provider,
                         22 * 60 * 60 + expire_offset, 0);
                 if (rc != MEMCACHED_SUCCESS) {
                     ipmeta_log(__func__,
-                            "Unable to cache SQL query result for %s:%u",
-                            tofind, page);
+                            "Unable to cache SQL query result for %s:%u -- %s",
+                            tofind, page,
+                            memcached_last_error_message(state->mc_hdl));
                     nocache = 1;
                 }
                 page ++;
