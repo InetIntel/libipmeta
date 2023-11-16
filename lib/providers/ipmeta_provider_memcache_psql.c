@@ -77,17 +77,19 @@
 #define STATE(p) (IPMETA_PROVIDER_STATE(memcache_psql, p))
 
 enum {
-    IPINFO_PSQL_COLUMN_PREFIX = 0,
-    IPINFO_PSQL_COLUMN_SOURCE = 1,
-    IPINFO_PSQL_COLUMN_PUBLISHED = 2,
-    IPINFO_PSQL_COLUMN_COUNTRY_CODE = 3,
-    IPINFO_PSQL_COLUMN_CONTINENT_CODE = 4,
-    IPINFO_PSQL_COLUMN_REGION = 5,
-    IPINFO_PSQL_COLUMN_CITY = 6,
-    IPINFO_PSQL_COLUMN_POST_CODE = 7,
-    IPINFO_PSQL_COLUMN_LATITUDE = 8,
-    IPINFO_PSQL_COLUMN_LONGITUDE = 9,
-    IPINFO_PSQL_COLUMN_TIMEZONE = 10,
+    IPINFO_PSQL_COLUMN_FIRSTADDR = 0,
+    IPINFO_PSQL_COLUMN_LASTADDR = 1,
+    IPINFO_PSQL_COLUMN_PREFIX = 2,
+    IPINFO_PSQL_COLUMN_SOURCE = 3,
+    IPINFO_PSQL_COLUMN_PUBLISHED = 4,
+    IPINFO_PSQL_COLUMN_COUNTRY_CODE = 5,
+    IPINFO_PSQL_COLUMN_CONTINENT_CODE = 6,
+    IPINFO_PSQL_COLUMN_REGION = 7,
+    IPINFO_PSQL_COLUMN_CITY = 8,
+    IPINFO_PSQL_COLUMN_POST_CODE = 9,
+    IPINFO_PSQL_COLUMN_LATITUDE = 10,
+    IPINFO_PSQL_COLUMN_LONGITUDE = 11,
+    IPINFO_PSQL_COLUMN_TIMEZONE = 12,
 };
 
 enum {
@@ -105,11 +107,17 @@ enum {
 
 const char *QUERY_PFX_SQL_BASE =
     "SELECT * FROM ("
-    "    SELECT * FROM %s_lookup WHERE prefix::inet && $1::inet "
-    ") WHERE published = (SELECT MAX(published) FROM ipmeta_records) "
+    "    SELECT * FROM %s_lookup WHERE firstaddr BETWEEN $1 AND $2 "
+    "    OR lastaddr BETWEEN $1 AND $2 "
+    ") WHERE published = $3 "
     " ORDER BY prefix ASC";
 
-#define QUERY_PFX_PARAM_COUNT 1
+const char *GET_LATEST_TIMESTAMP_SQL =
+    "SELECT datatimestamp FROM ipmeta_uploads WHERE source = $1 "
+    "ORDER BY uploaded DESC LIMIT 1";
+
+#define QUERY_PFX_PARAM_COUNT 3
+#define GET_LATEST_TS_PARAM_COUNT 1
 #define MAX_CACHE_SIZE (1024 * 1024 * 10)
 #define MORE_CACHED_FLAG "MORE..."
 
@@ -133,6 +141,9 @@ typedef struct ipmeta_provider_memcache_psql_state {
 
     char *provider;
 
+    char *max_published;
+    time_t last_max_pub_check;
+
     uint8_t disable_memcache;
     uint8_t more_cached_records;
     ipmeta_record_t *record;
@@ -149,6 +160,7 @@ typedef struct ipmeta_provider_memcache_psql_state {
 #ifdef HAVE_LIBPQ
     PGconn *pgconn;
     PGresult *query_pfx_stmt;
+    PGresult *query_latest_ts_stmt;
 #endif
 } ipmeta_provider_memcache_psql_state_t;
 
@@ -285,6 +297,13 @@ static int connect_pgsql(ipmeta_provider_memcache_psql_state_t *state) {
                 PQerrorMessage(state->pgconn));
         return -1;
     }
+    state->query_latest_ts_stmt = PQprepare(state->pgconn, "query_ts_stmt",
+            GET_LATEST_TIMESTAMP_SQL, GET_LATEST_TS_PARAM_COUNT, NULL);
+    if (PQresultStatus(state->query_latest_ts_stmt) != PGRES_COMMAND_OK) {
+        ipmeta_log(__func__, "failed to prepare timestamp query statement: %s",
+                PQerrorMessage(state->pgconn));
+        return -1;
+    }
 #endif
 
     return 0;
@@ -359,11 +378,18 @@ void ipmeta_provider_memcache_psql_free(ipmeta_provider_t *provider) {
     if (state->query_pfx_stmt) {
         PQclear(state->query_pfx_stmt);
     }
+    if (state->query_latest_ts_stmt) {
+        PQclear(state->query_latest_ts_stmt);
+    }
 
     if (state->pgconn) {
         PQfinish(state->pgconn);
     }
 #endif
+
+    if (state->max_published) {
+        free(state->max_published);
+    }
 
     if (state->accum_cache) {
         free(state->accum_cache);
@@ -423,6 +449,9 @@ static int process_psql_row_ipinfo(PGresult *pg_res, int row_id, int cols,
         value = PQgetvalue(pg_res, row_id, i);
 
         switch(i) {
+        case IPINFO_PSQL_COLUMN_FIRSTADDR:
+        case IPINFO_PSQL_COLUMN_LASTADDR:
+            break;
         case IPINFO_PSQL_COLUMN_PREFIX:
             if (ipvx_pton_pfx(value, &pfx) < 0) {
                 ipmeta_log(__func__,
@@ -680,8 +709,11 @@ static int lookup_prefix(ipmeta_provider_t *provider,
 
 #ifdef HAVE_LIBPQ
 #ifdef HAVE_LIBMEMCACHED
-    const char *params[QUERY_PFX_PARAM_COUNT];
+    const char *tsparams[GET_LATEST_TS_PARAM_COUNT];
+    char firststr[128];
+    char laststr[128];
     char tofind[INET6_ADDRSTRLEN + 4];
+    ipvx_prefix_t bound;
     PGresult *pg_res;
     int rows = 0, r, cols, mc_res;
     ipmeta_record_t *rec;
@@ -695,6 +727,7 @@ static int lookup_prefix(ipmeta_provider_t *provider,
     uint32_t page = 1;
     int cache_used = 0;
     int expire_offset;
+    struct timeval tv;
 
     if (ipvx_ntop_pfx(pfx, tofind) == NULL) {
         return IPMETA_ERR_INPUT;
@@ -729,17 +762,70 @@ static int lookup_prefix(ipmeta_provider_t *provider,
         return -1;
     }
 
-    params[0] = tofind;
-
-    pg_res = PQexecPrepared(state->pgconn, "query_pfx_stmt",
-            QUERY_PFX_PARAM_COUNT, params, NULL, NULL, 0);
-    if (PQntuples(pg_res) < 0) {
-        ipmeta_log(__func__, "ERROR: querying postgresql for prefix %s -- %s",
-                tofind, PQerrorMessage(state->pgconn));
+    gettimeofday(&tv, NULL);
+    if (tv.tv_sec - state->last_max_pub_check >= (12 * 60 * 60)) {
+        /* grab the timestamp of the most recent completed DB update */
+        char *ts_string;
+        tsparams[0] = state->provider;
+        pg_res = PQexecPrepared(state->pgconn, "query_ts_stmt",
+                GET_LATEST_TS_PARAM_COUNT, tsparams, NULL, NULL, 0);
+        if (PQntuples(pg_res) < 0) {
+            ipmeta_log(__func__,
+                    "ERROR: querying postgresql for latest timestamp -- %s",
+                    PQerrorMessage(state->pgconn));
+            PQclear(pg_res);
+            return IPMETA_ERR_INTERNAL;
+        }
+        cols = PQnfields(pg_res);
+        rows = PQntuples(pg_res);
+        if (rows <= 0 || cols <= 0) {
+            ipmeta_log(__func__,
+                    "WARNING: no results for latest timestamp query, DB lookups are going to fail");
+            return 0;
+        }
+        ts_string = PQgetvalue(pg_res, 0, 0);
+        if (ts_string != NULL) {
+            if (state->max_published) {
+                free(state->max_published);
+            }
+            state->max_published = strdup(ts_string);
+        }
+        state->last_max_pub_check = tv.tv_sec;
         PQclear(pg_res);
-        return IPMETA_ERR_INTERNAL;
     }
 
+    if (state->max_published == NULL) {
+        return IPMETA_ERR_INPUT;
+    }
+
+    if (pfx->family == AF_INET) {
+        const char *params[QUERY_PFX_PARAM_COUNT];
+
+        ipvx_first_addr(pfx, &bound);
+        snprintf(firststr, 128, "%u", ntohl(bound.addr.v4.s_addr));
+
+        ipvx_last_addr(pfx, &bound);
+        snprintf(laststr, 128, "%u", ntohl(bound.addr.v4.s_addr));
+
+
+        params[0] = firststr;
+        params[1] = laststr;
+        params[2] = state->max_published;
+
+        pg_res = PQexecPrepared(state->pgconn, "query_pfx_stmt",
+                QUERY_PFX_PARAM_COUNT, params, NULL, NULL, 0);
+        if (PQntuples(pg_res) < 0) {
+            ipmeta_log(__func__,
+                    "ERROR: querying postgresql for v4 prefix %s -- %s",
+                    tofind, PQerrorMessage(state->pgconn));
+            PQclear(pg_res);
+            return IPMETA_ERR_INTERNAL;
+        }
+    } else {
+        ipmeta_log(__func__,
+                "ERROR: IPv6 prefix queries are not supported yet!");
+        return IPMETA_ERR_INPUT;
+    }
 
     cols = PQnfields(pg_res);
     rows = PQntuples(pg_res);
@@ -825,8 +911,9 @@ static int lookup_prefix(ipmeta_provider_t *provider,
                         22 * 60 * 60 + expire_offset, 0);
         if (rc != MEMCACHED_SUCCESS) {
             ipmeta_log(__func__,
-                    "Unable to cache SQL query result for %s:%u",
-                    tofind, page);
+                    "Unable to cache SQL query result for %s:%u -- %s",
+                    tofind, page,
+                    memcached_last_error_message(state->mc_hdl));
             nocache = 1;
         }
     }

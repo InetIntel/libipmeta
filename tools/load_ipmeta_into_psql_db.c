@@ -68,9 +68,18 @@
 
 #define BUFFER_LEN 1024
 
+const char *INSERT_IPMETA_UPLOAD_SQL =
+    "INSERT INTO ipmeta_uploads (datatimestamp, uploaded, source) VALUES "
+    "($1, $2, $3)";
+
 const char *INSERT_IPINFO_PREFIX_SQL =
     "INSERT INTO ipmeta_prefixes (record_id, prefix) "
     "VALUES ($1, $2) "
+    "ON CONFLICT DO NOTHING";
+
+const char *INSERT_IPINFO_PREFIX_BOUNDS_SQL =
+    "INSERT INTO ipmeta_prefix_bounds (record_id, prefix, firstaddr, lastaddr) "
+    "VALUES ($1, $2, $3, $4) "
     "ON CONFLICT DO NOTHING";
 
 const char *INSERT_IPMETA_LOCATION_SQL =
@@ -86,7 +95,9 @@ const char *INSERT_IPMETA_RECORD_SQL =
     "location, post_code, latitude, longitude) "
     "VALUES ($1, $2, $3, $4, $5, $6) RETURNING id";
 
+#define INSERT_IPMETA_UPLOAD_PARAM_COUNT 3
 #define INSERT_IPINFO_PREFIX_PARAM_COUNT 2
+#define INSERT_IPINFO_PREFIX_BOUNDS_PARAM_COUNT 4
 #define INSERT_IPMETA_LOCATION_PARAM_COUNT 5
 #define INSERT_IPMETA_RECORD_PARAM_COUNT 6
 #define SELECT_IPMETA_LOCATION_PARAM_COUNT 4
@@ -118,7 +129,9 @@ typedef struct inserter_state {
     uint8_t skip_ipv6;
 
     PGconn *pgconn;
+    PGresult *insert_upload_stmt;
     PGresult *insert_pfx_stmt;
+    PGresult *insert_pfx_bounds_stmt;
     PGresult *insert_loc_stmt;
     PGresult *insert_rec_stmt;
     PGresult *select_loc_stmt;
@@ -280,6 +293,31 @@ static char *derive_timestamp_from_filename(const char *filename) {
 
     snprintf(tstr, 64, "%s 00:00:00", founddate);
     return strdup(tstr);
+}
+
+static void insert_upload_time_row(ipmeta_inserter_state_t *state) {
+
+    const char *params[INSERT_IPMETA_UPLOAD_PARAM_COUNT];
+    time_t t = time(NULL);
+    struct tm tm;
+    char timestr[1024];
+    PGresult *pg_res;
+
+    gmtime_r(&t, &tm);
+    strftime(timestr, 1000, "%F %T", &tm);
+
+    params[0] = state->timestamp_str;
+    params[1] = timestr;
+    params[2] = "ipinfo";
+
+    pg_res = PQexecPrepared(state->pgconn, "insert_upload",
+            INSERT_IPMETA_UPLOAD_PARAM_COUNT, params, NULL, NULL, 0);
+
+    if (PQresultStatus(pg_res) != PGRES_TUPLES_OK) {
+        fprintf(stderr, "Error while inserting new ipmeta upload entry: %s\n",
+                        PQerrorMessage(state->pgconn));
+    }
+    PQclear(pg_res);
 }
 
 static void parse_ipinfo_cell(void *s, size_t i, void *data) {
@@ -476,7 +514,11 @@ static int insert_pfx_into_psql(ipmeta_inserter_state_t *state,
 
     PGresult *pg_res;
     const char *values[INSERT_IPINFO_PREFIX_PARAM_COUNT];
+    const char *bounds_values[INSERT_IPINFO_PREFIX_BOUNDS_PARAM_COUNT];
+    ipvx_prefix_t res;
     char pfxstr[INET_ADDRSTRLEN + 4];
+    char firststr[INET_ADDRSTRLEN + 4];
+    char laststr[INET_ADDRSTRLEN + 4];
 
     char rec_id_str[32];
     int ret = 0;
@@ -486,13 +528,28 @@ static int insert_pfx_into_psql(ipmeta_inserter_state_t *state,
         return -1;
     }
 
+    ipvx_first_addr(&(pfx_node->prefix), &res);
+    if (ipvx_ntop_pfx(&res, firststr) == NULL) {
+        fprintf(stderr, "Unable to convert ipvx first addr to string\n");
+        return -1;
+    }
+
+    ipvx_last_addr(&(pfx_node->prefix), &res);
+    if (ipvx_ntop_pfx(&res, laststr) == NULL) {
+        fprintf(stderr, "Unable to convert ipvx last addr to string\n");
+        return -1;
+    }
+
     snprintf(rec_id_str, 32, "%ld", rec_id);
 
-    values[0] = rec_id_str;
-    values[1] = pfxstr;
+    bounds_values[0] = rec_id_str;
+    bounds_values[1] = pfxstr;
+    bounds_values[2] = firststr;
+    bounds_values[3] = laststr;
 
-    pg_res = PQexecPrepared(state->pgconn, "insert_ipmeta",
-            INSERT_IPINFO_PREFIX_PARAM_COUNT, values, NULL, NULL, 0);
+    pg_res = PQexecPrepared(state->pgconn, "insert_pfx_bounds",
+            INSERT_IPINFO_PREFIX_BOUNDS_PARAM_COUNT, bounds_values,
+            NULL, NULL, 0);
     if (PQresultStatus(pg_res) == PGRES_FATAL_ERROR) {
         fprintf(stderr, "Execution of prepared statement failed: %s\n",
                 PQresultErrorMessage(pg_res));
@@ -649,10 +706,30 @@ static int read_ipinfo_file(ipmeta_inserter_state_t *state,
         goto end;
     }
 
+    state->insert_upload_stmt = PQprepare(state->pgconn, "insert_upload",
+            INSERT_IPMETA_UPLOAD_SQL, INSERT_IPMETA_UPLOAD_PARAM_COUNT,
+            NULL);
+    if (PQresultStatus(state->insert_upload_stmt) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "Preparation of insert upload statement failed: %s\n",
+                PQerrorMessage(state->pgconn));
+        goto end;
+    }
+
     state->insert_pfx_stmt = PQprepare(state->pgconn, "insert_ipmeta",
             INSERT_IPINFO_PREFIX_SQL, INSERT_IPINFO_PREFIX_PARAM_COUNT, NULL);
     if (PQresultStatus(state->insert_pfx_stmt) != PGRES_COMMAND_OK) {
         fprintf(stderr, "Preparation of insert prefix statement failed: %s\n",
+                PQerrorMessage(state->pgconn));
+        goto end;
+    }
+
+    state->insert_pfx_bounds_stmt = PQprepare(state->pgconn,
+            "insert_pfx_bounds",
+            INSERT_IPINFO_PREFIX_BOUNDS_SQL,
+            INSERT_IPINFO_PREFIX_BOUNDS_PARAM_COUNT, NULL);
+    if (PQresultStatus(state->insert_pfx_bounds_stmt) != PGRES_COMMAND_OK) {
+        fprintf(stderr,
+                "Preparation of insert prefix bounds statement failed: %s\n",
                 PQerrorMessage(state->pgconn));
         goto end;
     }
@@ -755,10 +832,15 @@ static int read_ipinfo_file(ipmeta_inserter_state_t *state,
     }
     rc = 0;
 
+    /* update complete, insert the upload row */
+    insert_upload_time_row(state);
+
 end:
     csv_free(&(state->parser));
     wandio_destroy(file);
     PQclear(state->insert_pfx_stmt);
+    PQclear(state->insert_upload_stmt);
+    PQclear(state->insert_pfx_bounds_stmt);
     PQclear(state->insert_rec_stmt);
     PQclear(state->insert_loc_stmt);
     PQclear(state->select_loc_stmt);
