@@ -175,6 +175,10 @@ static inline char *sanitize(char *orig) {
             r++;
             continue;
         }
+        if (*r == '"') {
+            *r = 0x27;  // single quote
+            continue;
+        }
         *w = *r;
         r++; w++;
     }
@@ -479,18 +483,10 @@ static int process_psql_row_ipinfo(PGresult *pg_res, int row_id, int cols,
             strncpy(rec->continent_code, value, 2);
             break;
         case IPINFO_PSQL_COLUMN_REGION:
-            if (strchr(value, ',') == NULL) {
-                rec->region = strdup(value);
-            } else {
-                rec->region = sanitize(value);
-            }
+            rec->region = sanitize(value);
             break;
         case IPINFO_PSQL_COLUMN_CITY:
-            if (strchr(value, ',') == NULL) {
-                rec->city = strdup(value);
-            } else {
-                rec->city = sanitize(value);
-            }
+            rec->city = sanitize(value);
             break;
         case IPINFO_PSQL_COLUMN_POST_CODE:
             rec->post_code = strdup(value);
