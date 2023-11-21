@@ -262,8 +262,12 @@ ipmeta_record_set_t *ipmeta_record_set_init()
   return record_set;
 }
 
-void ipmeta_record_set_require_free(ipmeta_record_set_t *record_set) {
+void ipmeta_record_set_require_free(ipmeta_record_set_t *record_set,
+                            void (*custom_free)(ipmeta_record_t *, void *),
+                            void *custom_free_arg) {
   record_set->mustfree = 1;
+  record_set->custom_free = custom_free;
+  record_set->custom_free_arg = custom_free_arg;
 }
 
 void ipmeta_record_set_clear(ipmeta_record_set_t *record_set)
@@ -277,7 +281,11 @@ void ipmeta_record_set_clear(ipmeta_record_set_t *record_set)
     ipmeta_record_set_rewind(record_set);
     rec = ipmeta_record_set_next(record_set, NULL);
     while (rec) {
-      ipmeta_free_record(rec);
+      if (record_set->custom_free) {
+        record_set->custom_free(rec, record_set->custom_free_arg);
+      } else {
+        ipmeta_free_record(rec);
+      }
       rec = ipmeta_record_set_next(record_set, NULL);
     }
   }

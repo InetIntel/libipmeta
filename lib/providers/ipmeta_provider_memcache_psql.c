@@ -60,6 +60,7 @@
 #include "libcsv/csv.h"
 #include "utils.h"
 #include "ipvx_utils.h"
+#include "khash.h"
 
 #ifdef HAVE_LIBPQ
 #include <postgresql/libpq-fe.h>
@@ -75,6 +76,9 @@
 #define PROVIDER_NAME "memcache_psql"
 
 #define STATE(p) (IPMETA_PROVIDER_STATE(memcache_psql, p))
+
+KHASH_SET_INIT_STR(str_set)
+KHASH_MAP_INIT_STR(ll_map, double)
 
 enum {
     IPINFO_PSQL_COLUMN_FIRSTADDR = 0,
@@ -112,11 +116,19 @@ const char *QUERY_PFX_SQL_BASE =
     ") WHERE published = $3 "
     " ORDER BY prefix ASC";
 
+const char *QUERY_ENCAP_PFX_SQL_BASE =
+    "SELECT * FROM ("
+    "    SELECT * FROM %s_lookup WHERE $1 BETWEEN firstaddr AND lastaddr "
+    ") WHERE published = $2 "
+    " LIMIT 1";
+
+
 const char *GET_LATEST_TIMESTAMP_SQL =
     "SELECT datatimestamp FROM ipmeta_uploads WHERE source = $1 "
     "ORDER BY uploaded DESC LIMIT 1";
 
 #define QUERY_PFX_PARAM_COUNT 3
+#define QUERY_ENCAP_PFX_PARAM_COUNT 2
 #define GET_LATEST_TS_PARAM_COUNT 1
 #define MAX_CACHE_SIZE (1024 * 1024 * 10)
 #define MORE_CACHED_FLAG "MORE..."
@@ -157,15 +169,30 @@ typedef struct ipmeta_provider_memcache_psql_state {
     uint32_t cache_hits;
     uint32_t cache_misses;
 
+    /** set of timezone strings */
+    kh_str_set_t *timezones;
+
+    /** set of region name strings */
+    kh_str_set_t *regions;
+
+    /** set of city name strings */
+    kh_str_set_t *cities;
+
+    /** set of postcode strings */
+    kh_str_set_t *postcodes;
+
+    /** set of latitudes and longitudes */
+    kh_ll_map_t *latlongs;
+
 #ifdef HAVE_LIBPQ
     PGconn *pgconn;
     PGresult *query_pfx_stmt;
+    PGresult *query_encap_stmt;
     PGresult *query_latest_ts_stmt;
 #endif
 } ipmeta_provider_memcache_psql_state_t;
 
-static inline char *sanitize(char *orig) {
-    char *repl = calloc(strlen(orig) + 1, sizeof(char));
+static inline char *sanitize(char *orig, char *repl) {
     char *r, *w;
 
     r = orig; w = repl;
@@ -182,6 +209,7 @@ static inline char *sanitize(char *orig) {
         *w = *r;
         r++; w++;
     }
+    *w = '\0';
     return repl;
 }
 
@@ -301,6 +329,15 @@ static int connect_pgsql(ipmeta_provider_memcache_psql_state_t *state) {
                 PQerrorMessage(state->pgconn));
         return -1;
     }
+
+    snprintf(query_sql, 2048, QUERY_ENCAP_PFX_SQL_BASE, state->provider);
+    state->query_encap_stmt = PQprepare(state->pgconn, "query_encap_stmt",
+            query_sql, QUERY_ENCAP_PFX_PARAM_COUNT, NULL);
+    if (PQresultStatus(state->query_encap_stmt) != PGRES_COMMAND_OK) {
+        ipmeta_log(__func__, "failed to prepare encap query statement: %s",
+                PQerrorMessage(state->pgconn));
+        return -1;
+    }
     state->query_latest_ts_stmt = PQprepare(state->pgconn, "query_ts_stmt",
             GET_LATEST_TIMESTAMP_SQL, GET_LATEST_TS_PARAM_COUNT, NULL);
     if (PQresultStatus(state->query_latest_ts_stmt) != PGRES_COMMAND_OK) {
@@ -331,6 +368,72 @@ static int setup_memcached(ipmeta_provider_memcache_psql_state_t *state) {
     return 0;
 }
 
+static double insert_ll_into_map(char *latlong, kh_ll_map_t **map) {
+    int ret;
+    khiter_t k;
+
+    if (latlong == NULL) {
+        return -1.0;
+    }
+    k = kh_get(ll_map, *map, latlong);
+    if (k != kh_end(*map)) {
+        return (double) kh_value(*map, k);
+    } else {
+        k = kh_put(ll_map, *map, latlong, &ret);
+        if (ret >= 0) {
+            kh_key(*map, k) = strdup(latlong);
+            kh_value(*map, k) = strtod(latlong, NULL);
+            return (double) kh_value(*map, k);
+        }
+    }
+    return -1.0;
+}
+
+static char *insert_name_into_set(char *name, kh_str_set_t **set,
+        uint8_t sanitize_req) {
+    int ret;
+    char sanitized[1024];
+    khiter_t k;
+
+    if (name == NULL) {
+        return NULL;
+    }
+
+    if (sanitize_req) {
+        if (strlen(name) >= 1023) {
+            ipmeta_log(__func__,
+                    "unable to parse location token because it is too long: %s",
+                    name);
+            return NULL;
+        }
+        sanitize(name, sanitized);
+        name = sanitized;
+    }
+
+    k = kh_get(str_set, *set, name);
+    if (k != kh_end(*set)) {
+        return (char *) kh_key(*set, k);
+    } else {
+        k = kh_put(str_set, *set, name, &ret);
+        if (ret >= 0) {
+            kh_key(*set, k) = strdup(name);
+            return (char *) kh_key(*set, k);
+        }
+    }
+    return NULL;
+}
+
+static void rec_free(ipmeta_record_t *rec, void *arg) {
+
+    /* All of our strings should be in the maps of region names, post codes,
+     * etc so we don't want to free them.
+     */
+
+    if (rec) {
+        free(rec);
+    }
+}
+
 ipmeta_provider_t *ipmeta_provider_memcache_psql_alloc() {
     return &ipmeta_provider_memcache_psql;
 }
@@ -345,6 +448,12 @@ int ipmeta_provider_memcache_psql_init(ipmeta_provider_t *provider, int argc,
                 "unable to allocate ipmeta_provider_memcache_psql_state_t");
         return -1;
     }
+
+    state->timezones = kh_init(str_set);
+    state->regions = kh_init(str_set);
+    state->postcodes = kh_init(str_set);
+    state->cities = kh_init(str_set);
+    state->latlongs = kh_init(ll_map);
 
     ipmeta_provider_register_state(provider, state);
     if (parse_args(state, argc, argv) != 0) {
@@ -363,6 +472,7 @@ int ipmeta_provider_memcache_psql_init(ipmeta_provider_t *provider, int argc,
 
 void ipmeta_provider_memcache_psql_free(ipmeta_provider_t *provider) {
     ipmeta_provider_memcache_psql_state_t *state = STATE(provider);
+    khiter_t k;
 
     if (state == NULL) {
         return;
@@ -371,6 +481,52 @@ void ipmeta_provider_memcache_psql_free(ipmeta_provider_t *provider) {
     ipmeta_log(__func__,
             "Total cache hits: %u      Total cache misses: %u",
             state->cache_hits, state->cache_misses);
+
+    if (state->timezones) {
+        for (k = 0; k < kh_end(state->timezones); ++k) {
+            if (kh_exist(state->timezones, k)) {
+                free((void *)kh_key(state->timezones, k));
+            }
+        }
+        kh_destroy(str_set, state->timezones);
+    }
+
+    if (state->regions) {
+        for (k = 0; k < kh_end(state->regions); ++k) {
+            if (kh_exist(state->regions, k)) {
+                free((void *)kh_key(state->regions, k));
+            }
+        }
+        kh_destroy(str_set, state->regions);
+    }
+
+    if (state->cities) {
+        for (k = 0; k < kh_end(state->cities); ++k) {
+            if (kh_exist(state->cities, k)) {
+                free((void *)kh_key(state->cities, k));
+            }
+        }
+        kh_destroy(str_set, state->cities);
+    }
+
+    if (state->postcodes) {
+        for (k = 0; k < kh_end(state->postcodes); ++k) {
+            if (kh_exist(state->postcodes, k)) {
+                free((void *)kh_key(state->postcodes, k));
+            }
+        }
+        kh_destroy(str_set, state->postcodes);
+    }
+
+    if (state->latlongs) {
+        for (k = 0; k < kh_end(state->latlongs); ++k) {
+            if (kh_exist(state->latlongs, k)) {
+                free((void *)kh_key(state->latlongs, k));
+            }
+        }
+        kh_destroy(ll_map, state->latlongs);
+    }
+
 
 #ifdef HAVE_LIBMEMCACHED
     if (state->mc_hdl) {
@@ -381,6 +537,9 @@ void ipmeta_provider_memcache_psql_free(ipmeta_provider_t *provider) {
 #ifdef HAVE_LIBPQ
     if (state->query_pfx_stmt) {
         PQclear(state->query_pfx_stmt);
+    }
+    if (state->query_encap_stmt) {
+        PQclear(state->query_encap_stmt);
     }
     if (state->query_latest_ts_stmt) {
         PQclear(state->query_latest_ts_stmt);
@@ -430,12 +589,13 @@ void ipmeta_provider_memcache_psql_free(ipmeta_provider_t *provider) {
 }
 
 #ifdef HAVE_LIBPQ
-static int process_psql_row_ipinfo(PGresult *pg_res, int row_id, int cols,
-        ipmeta_record_t *rec, uint64_t *numips) {
+static int process_psql_row_ipinfo(ipmeta_provider_memcache_psql_state_t *state,
+        PGresult *pg_res, int row_id, int cols,
+        ipmeta_record_t *rec, uint64_t *numips,
+        ipvx_prefix_t *pfx) {
 
     char *value;
     int i;
-    ipvx_prefix_t pfx;
 
     if (rec == NULL) {
         ipmeta_log(__func__,
@@ -457,15 +617,15 @@ static int process_psql_row_ipinfo(PGresult *pg_res, int row_id, int cols,
         case IPINFO_PSQL_COLUMN_LASTADDR:
             break;
         case IPINFO_PSQL_COLUMN_PREFIX:
-            if (ipvx_pton_pfx(value, &pfx) < 0) {
+            if (ipvx_pton_pfx(value, pfx) < 0) {
                 ipmeta_log(__func__,
                     "invalid prefix returned by PSQL query: %s", value);
                 return -1;
             }
-            if (pfx.family == AF_INET) {
-                *numips = pow(2, (32 - pfx.masklen));
-            } else if (pfx.family == AF_INET6) {
-                *numips = pow(2, (128 - pfx.masklen));
+            if (pfx->family == AF_INET) {
+                *numips = pow(2, (32 - pfx->masklen));
+            } else if (pfx->family == AF_INET6) {
+                *numips = pow(2, (128 - pfx->masklen));
             } else {
                 *numips = 0;
             }
@@ -483,22 +643,23 @@ static int process_psql_row_ipinfo(PGresult *pg_res, int row_id, int cols,
             strncpy(rec->continent_code, value, 2);
             break;
         case IPINFO_PSQL_COLUMN_REGION:
-            rec->region = sanitize(value);
+            rec->region = insert_name_into_set(value, &(state->regions), 1);
             break;
         case IPINFO_PSQL_COLUMN_CITY:
-            rec->city = sanitize(value);
+            rec->city = insert_name_into_set(value, &(state->cities), 1);
             break;
         case IPINFO_PSQL_COLUMN_POST_CODE:
-            rec->post_code = strdup(value);
+            rec->post_code = insert_name_into_set(value, &(state->postcodes),
+                    1);
             break;
         case IPINFO_PSQL_COLUMN_LATITUDE:
-            rec->latitude = strtod(value, NULL);
+            rec->latitude = insert_ll_into_map(value, &(state->latlongs));
             break;
         case IPINFO_PSQL_COLUMN_LONGITUDE:
-            rec->longitude = strtod(value, NULL);
+            rec->longitude = insert_ll_into_map(value, &(state->latlongs));
             break;
         case IPINFO_PSQL_COLUMN_TIMEZONE:
-            rec->timezone = strdup(value);
+            rec->timezone = insert_name_into_set(value, &(state->timezones), 0);
             break;
         default:
             ipmeta_log(__func__,
@@ -542,22 +703,28 @@ static void parse_memcached_cell(void *s, size_t i, void *data) {
             strncpy(state->record->continent_code, tok, 2);
             break;
         case IPINFO_MC_COLUMN_REGION:
-            state->record->region = strdup(tok);
+            state->record->region = insert_name_into_set(tok,
+                    &(state->regions), 0);
             break;
         case IPINFO_MC_COLUMN_CITY:
-            state->record->city = strdup(tok);
+            state->record->city = insert_name_into_set(tok, &(state->cities),
+                    0);
             break;
         case IPINFO_MC_COLUMN_POST_CODE:
-            state->record->post_code = strdup(tok);
+            state->record->post_code = insert_name_into_set(tok,
+                    &(state->postcodes), 0);
             break;
         case IPINFO_MC_COLUMN_LATITUDE:
-            state->record->latitude = strtod(tok, NULL);
+            state->record->latitude = insert_ll_into_map(tok,
+                    &(state->latlongs));
             break;
         case IPINFO_MC_COLUMN_LONGITUDE:
-            state->record->longitude = strtod(tok, NULL);
+            state->record->longitude = insert_ll_into_map(tok,
+                    &(state->latlongs));
             break;
         case IPINFO_MC_COLUMN_TIMEZONE:
-            state->record->timezone = strdup(tok);
+            state->record->timezone = insert_name_into_set(tok,
+                    &(state->timezones), 0);
             break;
         case IPINFO_MC_COLUMN_NUMIPS:
             state->lookup_ip_cnt = strtol(tok, NULL, 10);
@@ -698,23 +865,63 @@ static ipmeta_record_t *generate_unknown_record(
     return rec;
 }
 
+static int update_latest_pub(ipmeta_provider_memcache_psql_state_t *state) {
+
+    struct timeval tv;
+    PGresult *pg_res;
+    const char *tsparams[GET_LATEST_TS_PARAM_COUNT];
+    int rows, cols;
+    char *ts_string;
+
+    gettimeofday(&tv, NULL);
+    if (tv.tv_sec - state->last_max_pub_check >= (12 * 60 * 60)) {
+        /* grab the timestamp of the most recent completed DB update */
+        tsparams[0] = state->provider;
+        pg_res = PQexecPrepared(state->pgconn, "query_ts_stmt",
+                GET_LATEST_TS_PARAM_COUNT, tsparams, NULL, NULL, 0);
+        if (PQntuples(pg_res) < 0) {
+            ipmeta_log(__func__,
+                    "ERROR: querying postgresql for latest timestamp -- %s",
+                    PQerrorMessage(state->pgconn));
+            PQclear(pg_res);
+            return IPMETA_ERR_INTERNAL;
+        }
+        cols = PQnfields(pg_res);
+        rows = PQntuples(pg_res);
+        if (rows <= 0 || cols <= 0) {
+            ipmeta_log(__func__,
+                    "WARNING: no results for latest timestamp query, DB lookups are going to fail");
+            return 0;
+        }
+        ts_string = PQgetvalue(pg_res, 0, 0);
+        if (ts_string != NULL) {
+            if (state->max_published) {
+                free(state->max_published);
+            }
+            state->max_published = strdup(ts_string);
+        }
+        state->last_max_pub_check = tv.tv_sec;
+        PQclear(pg_res);
+    }
+    return 1;
+}
 
 static int lookup_prefix(ipmeta_provider_t *provider,
         ipmeta_provider_memcache_psql_state_t *state,
         ipvx_prefix_t *pfx, ipmeta_record_set_t *records) {
 
+    int rec_count = 0;
+    uint64_t numips = 0;
+    ipmeta_record_t *rec;
 #ifdef HAVE_LIBPQ
 #ifdef HAVE_LIBMEMCACHED
-    const char *tsparams[GET_LATEST_TS_PARAM_COUNT];
+    const char *params[QUERY_PFX_PARAM_COUNT];
     char firststr[128];
     char laststr[128];
     char tofind[INET6_ADDRSTRLEN + 4];
     ipvx_prefix_t bound;
     PGresult *pg_res;
     int rows = 0, r, cols, mc_res;
-    ipmeta_record_t *rec;
-    int rec_count = 0;
-    uint64_t numips = 0;
     char mc_key[1024];
     char cache_str[4096];
     int nocache = 0;
@@ -723,13 +930,12 @@ static int lookup_prefix(ipmeta_provider_t *provider,
     uint32_t page = 1;
     int cache_used = 0;
     int expire_offset;
-    struct timeval tv;
 
     if (ipvx_ntop_pfx(pfx, tofind) == NULL) {
         return IPMETA_ERR_INPUT;
     }
 
-    ipmeta_record_set_require_free(records);
+    ipmeta_record_set_require_free(records, rec_free, NULL);
 
     do {
         mc_res = memcache_lookup(state, tofind, page, records, &rec_count);
@@ -758,36 +964,8 @@ static int lookup_prefix(ipmeta_provider_t *provider,
         return -1;
     }
 
-    gettimeofday(&tv, NULL);
-    if (tv.tv_sec - state->last_max_pub_check >= (12 * 60 * 60)) {
-        /* grab the timestamp of the most recent completed DB update */
-        char *ts_string;
-        tsparams[0] = state->provider;
-        pg_res = PQexecPrepared(state->pgconn, "query_ts_stmt",
-                GET_LATEST_TS_PARAM_COUNT, tsparams, NULL, NULL, 0);
-        if (PQntuples(pg_res) < 0) {
-            ipmeta_log(__func__,
-                    "ERROR: querying postgresql for latest timestamp -- %s",
-                    PQerrorMessage(state->pgconn));
-            PQclear(pg_res);
-            return IPMETA_ERR_INTERNAL;
-        }
-        cols = PQnfields(pg_res);
-        rows = PQntuples(pg_res);
-        if (rows <= 0 || cols <= 0) {
-            ipmeta_log(__func__,
-                    "WARNING: no results for latest timestamp query, DB lookups are going to fail");
-            return 0;
-        }
-        ts_string = PQgetvalue(pg_res, 0, 0);
-        if (ts_string != NULL) {
-            if (state->max_published) {
-                free(state->max_published);
-            }
-            state->max_published = strdup(ts_string);
-        }
-        state->last_max_pub_check = tv.tv_sec;
-        PQclear(pg_res);
+    if ((r = update_latest_pub(state)) <= 0) {
+        return r;
     }
 
     if (state->max_published == NULL) {
@@ -795,15 +973,18 @@ static int lookup_prefix(ipmeta_provider_t *provider,
     }
 
     if (pfx->family == AF_INET) {
-        const char *params[QUERY_PFX_PARAM_COUNT];
-
         ipvx_first_addr(pfx, &bound);
         snprintf(firststr, 128, "%u", ntohl(bound.addr.v4.s_addr));
 
         ipvx_last_addr(pfx, &bound);
         snprintf(laststr, 128, "%u", ntohl(bound.addr.v4.s_addr));
+    } else {
+        ipmeta_log(__func__,
+                "ERROR: IPv6 prefix queries are not supported yet!");
+        return IPMETA_ERR_INPUT;
+    }
 
-
+    if (pfx->family == AF_INET && pfx->masklen < 32) {
         params[0] = firststr;
         params[1] = laststr;
         params[2] = state->max_published;
@@ -817,14 +998,34 @@ static int lookup_prefix(ipmeta_provider_t *provider,
             PQclear(pg_res);
             return IPMETA_ERR_INTERNAL;
         }
+
+        cols = PQnfields(pg_res);
+        rows = PQntuples(pg_res);
+        if (rows <= 0) {
+            rows = 0;
+            PQclear(pg_res);
+        }
     } else {
-        ipmeta_log(__func__,
-                "ERROR: IPv6 prefix queries are not supported yet!");
-        return IPMETA_ERR_INPUT;
+        rows = 0;
     }
 
-    cols = PQnfields(pg_res);
-    rows = PQntuples(pg_res);
+    if (rows == 0) {
+        /* try looking for an encapsulating prefix instead */
+        params[0] = firststr;
+        params[1] = state->max_published;
+        pg_res = PQexecPrepared(state->pgconn, "query_encap_stmt",
+                QUERY_ENCAP_PFX_PARAM_COUNT, params, NULL, NULL, 0);
+        if (PQntuples(pg_res) < 0) {
+            ipmeta_log(__func__,
+                    "ERROR: querying postgresql for encap v4 prefix %s -- %s",
+                    tofind, PQerrorMessage(state->pgconn));
+            PQclear(pg_res);
+            return IPMETA_ERR_INTERNAL;
+        }
+
+        cols = PQnfields(pg_res);
+        rows = PQntuples(pg_res);
+    }
 
     if (rows <= 0) {
         return 0;
@@ -846,7 +1047,8 @@ static int lookup_prefix(ipmeta_provider_t *provider,
         /* TODO make this more generic, use function pointers from the
          * provider itself... */
         if (strcmp(state->provider, "ipinfo") == 0) {
-            if (process_psql_row_ipinfo(pg_res, r, cols, rec, &numips) < 0) {
+            if (process_psql_row_ipinfo(state, pg_res, r, cols, rec,
+                    &numips) < 0) {
                 ipmeta_free_record(rec);
                 rec_count = -1;
                 break;

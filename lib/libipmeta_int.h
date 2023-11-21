@@ -84,6 +84,8 @@ struct ipmeta_record_set {
 
   uint8_t mustfree; // if set, the records must be freed when the record
                     // set is cleared
+  void *custom_free_arg;
+  void (*custom_free)(ipmeta_record_t *, void *);
 };
 
 /** @} */
@@ -114,12 +116,25 @@ void ipmeta_record_set_clear(ipmeta_record_set_t *record_set);
  *  record set, and therefore they must be freed whenever the record
  *  set is cleared or destroyed.
  *
+ *  If you require a custom method to free individual records within the set
+ *  (i.e. some record members are owned by the record, but others are not),
+ *  then you can use the custom_free and custom_free_arg parameters to
+ *  provider your own function for freeing the record. If you instead simply
+ *  want libipmeta to free everything inside each record (and the record
+ *  itself), then set these parameters to NULL.
+ *
  * @param record_set    The record set whose records must be freed eventually.
+ * @param custom_free   A function to be called on each deleted record, instead
+ *                      of automatically freeing the record and its contents.
+ * @param custom_free_arg  User context data that will be passed into the
+ *                         custom_free function as its second parameter (arg).
  *
  * @note the "must free" flag is reset to "false" whenever the record set
  * is cleared, so you should call this anytime you are populating a record
  * set with records that must be freed later on.
  */
-void ipmeta_record_set_require_free(ipmeta_record_set_t *record_set);
+void ipmeta_record_set_require_free(ipmeta_record_set_t *record_set,
+        void (*custom_free)(ipmeta_record_t *, void *),
+        void *custom_free_arg);
 
 #endif /* __LIBIPMETA_INT_H */
