@@ -919,7 +919,7 @@ static int lookup_prefix(ipmeta_provider_t *provider,
     char firststr[128];
     char laststr[128];
     char tofind[INET6_ADDRSTRLEN + 4];
-    ipvx_prefix_t bound;
+    ipvx_prefix_t bound, foundpfx;
     PGresult *pg_res;
     int rows = 0, r, cols, mc_res;
     char mc_key[1024];
@@ -1048,7 +1048,7 @@ static int lookup_prefix(ipmeta_provider_t *provider,
          * provider itself... */
         if (strcmp(state->provider, "ipinfo") == 0) {
             if (process_psql_row_ipinfo(state, pg_res, r, cols, rec,
-                    &numips) < 0) {
+                    &numips, &foundpfx) < 0) {
                 ipmeta_free_record(rec);
                 rec_count = -1;
                 break;
