@@ -118,9 +118,9 @@ const char *QUERY_PFX_SQL_BASE =
 
 const char *QUERY_ENCAP_PFX_SQL_BASE =
     "SELECT * FROM ("
-    "    SELECT * FROM %s_lookup WHERE $1 BETWEEN firstaddr AND lastaddr "
-    ") WHERE published = $2 "
-    " LIMIT 1";
+    "    SELECT * FROM %s_lookup WHERE published = $2 AND firstaddr <= $1 "
+    "    ORDER BY firstaddr DESC LIMIT 10) "
+    "WHERE lastaddr >= $1";
 
 
 const char *GET_LATEST_TIMESTAMP_SQL =
@@ -168,6 +168,8 @@ typedef struct ipmeta_provider_memcache_psql_state {
 
     uint32_t cache_hits;
     uint32_t cache_misses;
+
+    ipmeta_record_t *freelist_head;
 
     /** set of timezone strings */
     kh_str_set_t *timezones;
@@ -428,10 +430,11 @@ static void rec_free(ipmeta_record_t *rec, void *arg) {
     /* All of our strings should be in the maps of region names, post codes,
      * etc so we don't want to free them.
      */
+    ipmeta_provider_memcache_psql_state_t *state =
+            (ipmeta_provider_memcache_psql_state_t *)arg;
 
-    if (rec) {
-        free(rec);
-    }
+    rec->next = state->freelist_head;
+    state->freelist_head = rec;
 }
 
 ipmeta_provider_t *ipmeta_provider_memcache_psql_alloc() {
@@ -449,6 +452,7 @@ int ipmeta_provider_memcache_psql_init(ipmeta_provider_t *provider, int argc,
         return -1;
     }
 
+    state->freelist_head = NULL;
     state->timezones = kh_init(str_set);
     state->regions = kh_init(str_set);
     state->postcodes = kh_init(str_set);
@@ -473,6 +477,7 @@ int ipmeta_provider_memcache_psql_init(ipmeta_provider_t *provider, int argc,
 void ipmeta_provider_memcache_psql_free(ipmeta_provider_t *provider) {
     ipmeta_provider_memcache_psql_state_t *state = STATE(provider);
     khiter_t k;
+    ipmeta_record_t *ptr, *tmp;
 
     if (state == NULL) {
         return;
@@ -481,6 +486,13 @@ void ipmeta_provider_memcache_psql_free(ipmeta_provider_t *provider) {
     ipmeta_log(__func__,
             "Total cache hits: %u      Total cache misses: %u",
             state->cache_hits, state->cache_misses);
+
+    ptr = state->freelist_head;
+    while (ptr) {
+        tmp = ptr;
+        ptr = ptr->next;
+        free(tmp);
+    }
 
     if (state->timezones) {
         for (k = 0; k < kh_end(state->timezones); ++k) {
@@ -685,7 +697,13 @@ static void parse_memcached_cell(void *s, size_t i, void *data) {
     }
 
     if (state->record == NULL) {
-        state->record = calloc(1, sizeof(ipmeta_record_t));
+        if (state->freelist_head) {
+            state->record = state->freelist_head;
+            state->freelist_head = state->record->next;
+            memset(state->record, 0, sizeof(ipmeta_record_t));
+        } else {
+            state->record = calloc(1, sizeof(ipmeta_record_t));
+        }
         strncpy(state->record->country_code, "??", 2);
         strncpy(state->record->continent_code, "??", 2);
     }
@@ -770,6 +788,42 @@ static void parse_memcached_row(int c, void *data) {
     state->column_num = 0;
 }
 
+static int parse_csv_cached_rows(ipmeta_provider_memcache_psql_state_t *state,
+        char *value, size_t vallen) {
+
+    char *nextline, *thisline;
+    char *tok, *endtok;
+    int i;
+
+    thisline = strtok_r(value, "\n", &nextline);
+    while (thisline) {
+        i = 0;
+
+        tok = thisline;
+        endtok = strchr(tok, ',');
+
+        while (endtok) {
+            if (tok == endtok) {
+                /* consecutive ,, i.e. no value */
+                parse_memcached_cell(NULL, i, state);
+            } else {
+                *endtok = '\0';
+                parse_memcached_cell(tok, i, state);
+            }
+            i++;
+            tok = endtok + 1;
+            endtok = strchr(tok, ',');
+        }
+        if (tok != NULL) {
+            parse_memcached_cell(tok, i, state);
+        }
+
+        parse_memcached_row(i, state);
+        thisline = strtok_r(NULL, "\n", &nextline);
+    }
+
+    return 0;
+}
 
 #if HAVE_LIBMEMCACHED
 static int memcache_lookup(ipmeta_provider_memcache_psql_state_t *state,
@@ -806,13 +860,16 @@ static int memcache_lookup(ipmeta_provider_memcache_psql_state_t *state,
 
     state->cache_hits ++;
 
-    csv_init(&csvp, CSV_STRICT | CSV_REPALL_NL | CSV_STRICT_FINI |
-            CSV_APPEND_NULL | CSV_EMPTY_IS_NULL);
+    //csv_init(&csvp, CSV_STRICT | CSV_REPALL_NL | CSV_STRICT_FINI |
+    //        CSV_APPEND_NULL | CSV_EMPTY_IS_NULL);
     state->lookup_record_cnt = 0;
     state->lookup_ip_cnt = 0;
     state->lookup_results = records;
     state->column_num = 0;
 
+    parse_csv_cached_rows(state, value, vallen);
+
+/*
     if (csv_parse(&csvp, value, vallen, parse_memcached_cell,
                             parse_memcached_row, state) != (int) vallen) {
             ipmeta_log("memcache_psql", "CSV parsing error: %s",
@@ -822,7 +879,9 @@ static int memcache_lookup(ipmeta_provider_memcache_psql_state_t *state,
             csv_free(&csvp);
             return -1;
     }
+*/
     free(value);
+/*
     if (csv_fini(&csvp, parse_memcached_cell, parse_memcached_row, state) != 0) {
         ipmeta_log(__func__, "CSV parsing error: %s",
                 csv_strerror(csv_error(&csvp)));
@@ -830,9 +889,10 @@ static int memcache_lookup(ipmeta_provider_memcache_psql_state_t *state,
         csv_free(&csvp);
         return -1;
     }
+*/
     *rec_count = state->lookup_record_cnt;
     state->lookup_results = NULL;
-    csv_free(&csvp);
+//    csv_free(&csvp);
     return *rec_count;
 }
 #endif
@@ -847,7 +907,13 @@ static ipmeta_record_t *generate_unknown_record(
 
     ipmeta_record_t *rec;
 
-    rec = calloc(1, sizeof(ipmeta_record_t));
+    if (state->freelist_head) {
+        rec = state->freelist_head;
+        state->freelist_head = rec->next;
+        memset(rec, 0, sizeof(ipmeta_record_t));
+    } else {
+        rec = calloc(1, sizeof(ipmeta_record_t));
+    }
     rec->id = 0;
     rec->source = ipmeta_get_provider_id(provider);
     strncpy(rec->country_code, "??", 2);
@@ -911,7 +977,7 @@ static int lookup_prefix(ipmeta_provider_t *provider,
         ipvx_prefix_t *pfx, ipmeta_record_set_t *records) {
 
     int rec_count = 0;
-    uint64_t numips = 0;
+    uint64_t numips = 0, maxnumips;
     ipmeta_record_t *rec;
 #ifdef HAVE_LIBPQ
 #ifdef HAVE_LIBMEMCACHED
@@ -935,7 +1001,7 @@ static int lookup_prefix(ipmeta_provider_t *provider,
         return IPMETA_ERR_INPUT;
     }
 
-    ipmeta_record_set_require_free(records, rec_free, NULL);
+    ipmeta_record_set_require_free(records, rec_free, state);
 
     do {
         mc_res = memcache_lookup(state, tofind, page, records, &rec_count);
@@ -979,8 +1045,8 @@ static int lookup_prefix(ipmeta_provider_t *provider,
         ipvx_last_addr(pfx, &bound);
         snprintf(laststr, 128, "%u", ntohl(bound.addr.v4.s_addr));
     } else {
-        ipmeta_log(__func__,
-                "ERROR: IPv6 prefix queries are not supported yet!");
+        //ipmeta_log(__func__,
+        //        "ERROR: IPv6 prefix queries are not supported yet!");
         return IPMETA_ERR_INPUT;
     }
 
@@ -1042,7 +1108,13 @@ static int lookup_prefix(ipmeta_provider_t *provider,
     expire_offset = 5 * (rand() % 48);
 
     for (r = 0; r < rows; r++) {
-        rec = calloc(1, sizeof(ipmeta_record_t));
+        if (state->freelist_head) {
+            rec = state->freelist_head;
+            state->freelist_head = rec->next;
+            memset(rec, 0, sizeof(ipmeta_record_t));
+        } else {
+            rec = calloc(1, sizeof(ipmeta_record_t));
+        }
 
         /* TODO make this more generic, use function pointers from the
          * provider itself... */
@@ -1053,6 +1125,16 @@ static int lookup_prefix(ipmeta_provider_t *provider,
                 rec_count = -1;
                 break;
             }
+        }
+
+        if (pfx->family == AF_INET) {
+            maxnumips = pow(2, (32 - pfx->masklen));
+        } else {
+            maxnumips = pow(2, (128 - pfx->masklen));
+        }
+        if (numips > maxnumips) {
+            /* query returned an encapsulating prefix */
+            numips = maxnumips;
         }
 
         if (ipmeta_record_set_add_record(records, rec, numips) != 0) {
