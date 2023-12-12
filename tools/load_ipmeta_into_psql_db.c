@@ -72,35 +72,57 @@ const char *INSERT_IPMETA_UPLOAD_SQL =
     "INSERT INTO ipmeta_uploads (datatimestamp, uploaded, source) VALUES "
     "($1, $2, $3)";
 
-const char *INSERT_IPINFO_PREFIX_SQL =
-    "INSERT INTO ipmeta_prefixes (record_id, prefix) "
-    "VALUES ($1, $2) "
-    "ON CONFLICT DO NOTHING";
-
 const char *INSERT_IPINFO_PREFIX_BOUNDS_SQL =
     "INSERT INTO ipmeta_prefix_bounds (record_id, prefix, firstaddr, lastaddr) "
     "VALUES ($1, $2, $3, $4) "
     "ON CONFLICT DO NOTHING";
 
 const char *INSERT_IPMETA_LOCATION_SQL =
-    "INSERT INTO ipmeta_locations (country_code, continent_code, region, "
-    "city, timezone) VALUES ($1, $2, $3, $4, $5) RETURNING id";
+    "INSERT INTO ipmeta_locations (country_code, continent_code, "
+    "region_code, city_code, timezone) VALUES ($1, $2, $3, $4, $5) "
+    "RETURNING id";
 
 const char *SELECT_IPMETA_LOCATION_SQL =
     "SELECT id FROM ipmeta_locations WHERE country_code = $1 AND "
-    "continent_code = $2 AND region = $3 AND city = $4";
+    "continent_code = $2 AND region_code = $3 AND city_code = $4";
 
 const char *INSERT_IPMETA_RECORD_SQL =
     "INSERT INTO ipmeta_records (source, published, "
     "location, post_code, latitude, longitude) "
     "VALUES ($1, $2, $3, $4, $5, $6) RETURNING id";
 
+const char *SELECT_UNKNOWN_REGIONS_META_SQL =
+    "SELECT mddb_entity_attribute.value, mddb_entity.code "
+    "FROM mddb_entity JOIN mddb_entity_attribute ON "
+    "mddb_entity.id = mddb_entity_attribute.metadata_id "
+    "WHERE mddb_entity.name LIKE '%Unknown Region%' AND "
+    "mddb_entity_attribute.key = 'country_code'";
+
+const char *SELECT_CITY_NAME_SQL =
+    "SELECT * FROM mddb_entity JOIN mddb_entity_attribute ON "
+    "mddb_entity.id = mddb_entity_attribute.metadata_id "
+    "WHERE mddb_entity.type_id = 5 AND "
+    "mddb_entity.name = $2 AND "
+    "mddb_entity_attribute.key = 'region_code' AND "
+    "mddb_entity_attribute.value = $1 ";
+
+const char *INSERT_METADATA_CITY_SQL =
+    "INSERT INTO mddb_entity (type_id, code, name) VALUES "
+    "(5, $1, $2) RETURNING id";
+
+const char *INSERT_METADATA_CITY_ATTR_SQL =
+    "INSERT INTO mddb_entity_attribute (metadata_id, key, value) VALUES "
+    "($1, $2, $3)";
+
+
 #define INSERT_IPMETA_UPLOAD_PARAM_COUNT 3
-#define INSERT_IPINFO_PREFIX_PARAM_COUNT 2
 #define INSERT_IPINFO_PREFIX_BOUNDS_PARAM_COUNT 4
 #define INSERT_IPMETA_LOCATION_PARAM_COUNT 5
 #define INSERT_IPMETA_RECORD_PARAM_COUNT 6
 #define SELECT_IPMETA_LOCATION_PARAM_COUNT 4
+#define SELECT_CITY_NAME_PARAM_COUNT = 2
+#define INSERT_METADATA_CITY_PARAM_COUNT = 2
+#define INSERT_METADATA_CITY_ATTR_PARAM_COUNT = 3
 
 // convert char[2] to uint16_t
 #define c2_to_u16(c2) (((c2)[0] << 8) | (c2)[1])
@@ -108,6 +130,7 @@ const char *INSERT_IPMETA_RECORD_SQL =
 KHASH_INIT(u16u16, uint16_t, uint16_t, 1, kh_int_hash_func, kh_int_hash_equal)
 
 KHASH_SET_INIT_STR(str_set)
+KHASH_MAP_INIT_STR(ll_region_map, char *)
 
 // convert uint16_t to char[2]
 #define u16_to_c2(u16, c2)                                                     \
@@ -124,19 +147,29 @@ typedef struct inserter_state {
     char *psql_username;
     char *psql_password;
     char *psql_dbname;
+    char *meta_psql_host;
+    char *meta_psql_port;
+    char *meta_psql_username;
+    char *meta_psql_password;
+    char *meta_psql_dbname;
     char *timestamp_str;
+    char *regions_file;
 
     uint8_t skip_ipv6;
 
     PGconn *pgconn;
     PGresult *insert_upload_stmt;
-    PGresult *insert_pfx_stmt;
     PGresult *insert_pfx_bounds_stmt;
     PGresult *insert_loc_stmt;
     PGresult *insert_rec_stmt;
     PGresult *select_loc_stmt;
+    PGresult *insert_city_stmt;
+    PGresult *insert_city_attr_stmt;
     uint8_t psql_error;
     int trans_size;
+
+    PGconn *meta_pgconn;
+    PGresult *lookup_city_stmt;
 
     struct csv_parser parser;
     int current_line;
@@ -145,13 +178,18 @@ typedef struct inserter_state {
     int next_record_id;
     void (*parse_row)(int, void *);
     ipmeta_record_t *record;
+    char *rec_lat;
+    char *rec_long;
     ipvx_prefix_t block_lower;
     ipvx_prefix_t block_upper;
+    khiter_t reg_k;
 
     const char *current_filename;
 
     /** map from country to continent */
     khash_t(u16u16) *country_continent;
+    khash_t(ll_region_map) *regions_map;
+    khash_t(ll_region_map) *unknown_regions_map;
 
 } ipmeta_inserter_state_t;
 
@@ -170,16 +208,31 @@ typedef enum column_list {
     LOCATION_COL_ENDCOL,        ///< 1 past the last column ID
 } location_cols_t;
 
+typedef enum region_col_list {
+    REGION_MAP_LATITUDE,
+    REGION_MAP_LONGITUDE,
+    REGION_MAP_LATLONG_STR,
+    REGION_MAP_REGION_ID,
+    REGION_MAP_REGION_NAME,
+    REGION_MAP_REGION_CODED
+} region_map_cols_t;
+
 /** Prints usage information to stderr */
 static void usage(char *progname) {
     fprintf(stderr,
-        "Usage: %s -l locations\n"
+        "Usage: %s -l <ipinfo file> -r <region map file> \n"
         "    -l <file>  The file containing the location data\n"
-        "    -H <host>  The IP or hostname of the PSQL server\n"
-        "    -P <port>  The port number of the PSQL service (default: 5672)\n"
-        "    -U <user>  The username to log in with (default: postgres)\n"
-        "    -A <password> The password to log in with (default: no password) \n"
-        "    -d <dbname>  The name of the database (default: ipmeta)\n",
+        "    -r <file>  The file containing the lat-long to IODA region mappings\n\n"
+        "    -H <host>  The IP or hostname of the PSQL server for the IPInfo database\n"
+        "    -P <port>  The port number of the PSQL service for the IPInfo database (default: 5672)\n"
+        "    -U <user>  The username to log in to the IPInfo database with (default: postgres)\n"
+        "    -A <password> The password to log in to the IPInfo database with (default: no password) \n"
+        "    -d <dbname>  The name of the IPInfo database (default: ipmeta)\n\n"
+        "    -s <host>  The IP or hostname of the PSQL server for the IODA metadata database\n"
+        "    -m <port>  The port number of the PSQL service for the IODA metadata database (default: 5672)\n"
+        "    -R <user>  The username to log in to the IODA metadata database with (default: postgres)\n"
+        "    -X <password> The password to log in to the IODA metadata database with (default: no password) \n"
+        "    -M <dbname>  The name of the IODA metadata database (default: ioda_api_v2)\n",
         progname);
 }
 
@@ -194,7 +247,7 @@ static int parse_args(ipmeta_inserter_state_t *state, int argc, char **argv) {
     }
 
     optind = 1;
-    while ((opt = getopt(argc, argv, "4l:H:P:d:U:A:?")) >= 0) {
+    while ((opt = getopt(argc, argv, "4l:H:r:P:d:U:A:s:m:R:X:M:?")) >= 0) {
         switch (opt) {
             case 'l':
                 if (state->locations_file) {
@@ -203,6 +256,14 @@ static int parse_args(ipmeta_inserter_state_t *state, int argc, char **argv) {
                     return -1;
                 }
                 state->locations_file = strdup(optarg);
+                break;
+            case 'r':
+                if (state->regions_file) {
+                    fprintf(stderr,
+                            "ERROR: only one region map file is allowed\n");
+                    return -1;
+                }
+                state->regions_file = strdup(optarg);
                 break;
             case '4':
                 state->skip_ipv6 = 1;
@@ -221,6 +282,21 @@ static int parse_args(ipmeta_inserter_state_t *state, int argc, char **argv) {
                 break;
             case 'A':
                 state->psql_password = strdup(optarg);
+                break;
+            case 's':
+                state->meta_psql_host = strdup(optarg);
+                break;
+            case 'm':
+                state->meta_psql_port = strdup(optarg);
+                break;
+            case 'M':
+                state->meta_psql_dbname = strdup(optarg);
+                break;
+            case 'R':
+                state->meta_psql_username = strdup(optarg);
+                break;
+            case 'X':
+                state->meta_psql_password = strdup(optarg);
                 break;
             case '?':
             case ':':
@@ -243,6 +319,19 @@ static int parse_args(ipmeta_inserter_state_t *state, int argc, char **argv) {
         state->psql_username = strdup("postgres");
     }
 
+    if (state->meta_psql_host == NULL) {
+        state->meta_psql_host = strdup("localhost");
+    }
+    if (state->meta_psql_port == NULL) {
+        state->meta_psql_port = strdup("5672");
+    }
+    if (state->meta_psql_dbname == NULL) {
+        state->meta_psql_dbname = strdup("ioda_api_v2");
+    }
+    if (state->meta_psql_username == NULL) {
+        state->meta_psql_username = strdup("postgres");
+    }
+
     if (optind != argc) {
         fprintf(stderr, "ERROR: extra arguments to %s\n", argv[0]);
         usage(argv[0]);
@@ -254,6 +343,9 @@ static int parse_args(ipmeta_inserter_state_t *state, int argc, char **argv) {
                 "ERROR: locations file must be specified using -l!\n");
         usage(argv[0]);
         return -1;
+    }
+    if (state->regions_file == NULL) {
+        state->regions_file = strdup("/data/ipinfo-region-map.csv");
     }
     return 0;
 }
@@ -318,6 +410,57 @@ static void insert_upload_time_row(ipmeta_inserter_state_t *state) {
                         PQerrorMessage(state->pgconn));
     }
     PQclear(pg_res);
+}
+
+static void parse_ll_region_cell(void *s, size_t i, void *data) {
+    ipmeta_inserter_state_t *state = (ipmeta_inserter_state_t *)(data);
+    char *tok = (char *)s;
+    int ret;
+    khiter_t k;
+
+    switch(state->current_column) {
+        case REGION_MAP_LATITUDE:
+            state->reg_k = -1;
+            break;
+        case REGION_MAP_LONGITUDE:
+        case REGION_MAP_REGION_NAME:
+        case REGION_MAP_REGION_CODED:
+            break;
+        case REGION_MAP_LATLONG_STR:
+            if (tok != NULL) {
+                k = kh_get(ll_region_map, state->regions_map, tok);
+                if (k != kh_end(state->regions_map)) {
+                    fprintf(stderr, "WARNING: %s appears multiple times in region mapping file?\n", tok);
+                    state->reg_k = k;
+                    break;
+                }
+                k = kh_put(ll_region_map, state->regions_map, tok, &ret);
+                if (ret >= 0) {
+                    kh_key(state->regions_map, k) = strdup(tok);
+                    kh_value(state->regions_map, k) = 0;
+                    state->reg_k = k;
+                } else {
+                    fprintf(stderr, "ERROR: while inserting region map entry for %s\n", tok);
+                    state->reg_k = -1;
+                }
+            }
+            break;
+        case REGION_MAP_REGION_ID:
+            if (tok == NULL) {
+                fprintf(stderr, "WARNING: no region ID on line %u\n",
+                        state->current_line);
+                break;
+            }
+            if (state->reg_k == -1) {
+                fprintf(stderr, "WARNING: no saved latlong key for line %u\n",
+                        state->current_line);
+                break;
+            }
+            kh_value(state->regions_map, state->reg_k) = strdup(tok);
+            state->reg_k = -1;
+            break;
+    }
+    state->current_column ++;
 }
 
 static void parse_ipinfo_cell(void *s, size_t i, void *data) {
@@ -402,21 +545,13 @@ static void parse_ipinfo_cell(void *s, size_t i, void *data) {
             }
             break;
         case LOCATION_COL_LAT:
-            if (tok && *tok) {
-                rec->latitude = strtod(tok, &end);
-                if (end == tok || *end || rec->latitude < -90 ||
-                        rec->latitude > 90) {
-                    col_invalid(state, "Invalid latitude", tok);
-                }
+            if (tok) {
+                state->rec_lat = strdup(tok);
             }
             break;
         case LOCATION_COL_LONG:
-            if (tok && *tok) {
-                rec->longitude = strtod(tok, &end);
-                if (end == tok || *end || rec->longitude < -180 ||
-                        rec->longitude > 180) {
-                    col_invalid(state, "Invalid longitude", tok);
-                }
+            if (tok) {
+                state->rec_long = strdup(tok);
             }
             break;
         case LOCATION_COL_JOINKEY:
@@ -434,20 +569,16 @@ static int64_t insert_record_into_psql(ipmeta_inserter_state_t *state,
     const char *values[INSERT_IPMETA_RECORD_PARAM_COUNT];
     int64_t retid = -1;
 
-    char longstr[32];
-    char latstr[32];
     char loc_id_str[32];
 
-    snprintf(latstr, 32, "%.6f", state->record->latitude);
-    snprintf(longstr, 32, "%.6f", state->record->longitude);
     snprintf(loc_id_str, 32, "%ld", loc_id);
 
     values[0] = "ipinfo";
     values[1] = state->timestamp_str;
     values[2] = loc_id_str;
     values[3] = state->record->post_code;
-    values[4] = latstr;
-    values[5] = longstr;
+    values[4] = state->rec_lat;
+    values[5] = state->rec_long;
 
     pg_res = PQexecPrepared(state->pgconn, "insert_record",
             INSERT_IPMETA_RECORD_PARAM_COUNT, values, NULL, NULL, 0);
@@ -462,17 +593,56 @@ static int64_t insert_record_into_psql(ipmeta_inserter_state_t *state,
     return retid;
 }
 
+static char *lookup_region_code(ipmeta_inserter_state_t *state,
+        char *def_label) {
+
+    char latlong[1024];
+    khiter_t k;
+
+    if (state->rec_lat != NULL && state->rec_long != NULL) {
+        snprintf(latlong, 1024, "%s,%s", state->rec_lat, state->rec_long);
+
+        k = kh_get(ll_region_map, state->regions_map, latlong);
+        if (k != kh_end(state->regions_map)) {
+            return (char *)kh_value(state->regions_map, k);
+        }
+    }
+
+    k = kh_get(ll_region_map, state->unknown_regions_map,
+            state->record->country_code);
+    if (k == kh_end(state->unknown_regions_map)) {
+        snprintf(def_label, 1024, "Unknown Region in Unknown Country");
+        return def_label;
+    }
+    return (char *)kh_value(state->unknown_regions_map, k);
+}
+
 static int64_t insert_location_into_psql(ipmeta_inserter_state_t *state) {
 
     PGresult *pg_res, *ins_res;
     const char *values[INSERT_IPMETA_LOCATION_PARAM_COUNT];
     int64_t retid = -1;
+    char def_region_label[1024];
+    char def_city_label[1024];
 
     assert(INSERT_IPMETA_LOCATION_PARAM_COUNT >=
             SELECT_IPMETA_LOCATION_PARAM_COUNT);
 
     values[0] = state->record->country_code;
     values[1] = state->record->continent_code;
+
+    values[2] = lookup_region_code(state, def_region_label);
+
+    printf("DEVDEBUG: %s %s,%s %s,%s     %s\n",
+            state->record->region ? state->record->region: "No Region"
+            , state->rec_lat, state->rec_long,
+            state->record->city ? state->record->city : "No City",
+            state->record->country_code, values[2]);
+    return 1;
+
+//    values[3] = lookup_city_code(state, def_city_label);
+
+
     if (state->record->region == NULL) {
         if (state->record->city) {
             values[2] = state->record->city;
@@ -513,7 +683,6 @@ static int insert_pfx_into_psql(ipmeta_inserter_state_t *state,
         ipvx_prefix_list_t *pfx_node, int64_t rec_id) {
 
     PGresult *pg_res;
-    const char *values[INSERT_IPINFO_PREFIX_PARAM_COUNT];
     const char *bounds_values[INSERT_IPINFO_PREFIX_BOUNDS_PARAM_COUNT];
     ipvx_prefix_t res;
     char pfxstr[INET_ADDRSTRLEN + 4];
@@ -565,6 +734,13 @@ static int insert_pfx_into_psql(ipmeta_inserter_state_t *state,
 
     PQclear(pg_res);
     return ret;
+}
+
+static void parse_ll_region_row(int c, void *data) {
+    ipmeta_inserter_state_t *state = (ipmeta_inserter_state_t *)(data);
+
+    state->current_line ++;
+    state->current_column = 0;
 }
 
 static void parse_ipinfo_row(int c, void *data) {
@@ -635,6 +811,7 @@ static void parse_ipinfo_row(int c, void *data) {
     }
 
     loc_id = insert_location_into_psql(state);
+    goto rowdone;       // TODO REMOVE
     if (loc_id <= 0) {
         state->psql_error = 1;
         goto rowdone;
@@ -663,6 +840,12 @@ rowdone:
     state->current_line ++;
     state->current_column = 0;
     ipmeta_clean_record(state->record);
+    if (state->rec_lat) {
+        free(state->rec_lat);
+    }
+    if (state->rec_long) {
+        free(state->rec_long);
+    }
 
     return;
 }
@@ -689,9 +872,155 @@ static void load_country_continent_map(ipmeta_inserter_state_t *state) {
     }
 }
 
+static int lookup_unknown_regions(ipmeta_inserter_state_t *state) {
+
+    PGresult *pg_res = NULL;
+    int r, i, ret;
+    khiter_t k;
+    char *value;
+
+    pg_res = PQexec(state->meta_pgconn, SELECT_UNKNOWN_REGIONS_META_SQL);
+    if (PQresultStatus(pg_res) == PGRES_FATAL_ERROR) {
+        fprintf(stderr, "Execution of unknown region lookup failed: %s\n",
+                PQresultErrorMessage(pg_res));
+        goto lookup_fail;
+    } else if (PQresultStatus(pg_res) != PGRES_TUPLES_OK) {
+        fprintf(stderr,
+                "Non fatal error when executing unknown region lookup: %d %s\n",
+                PQresultStatus(pg_res), PQresultErrorMessage(pg_res));
+        goto lookup_fail;
+    }
+
+    state->unknown_regions_map = kh_init(ll_region_map);
+    for (r = 0; r < PQntuples(pg_res); r++) {
+        k = -1;
+        for (i = 0; i < 2; i++) {
+            value = PQgetvalue(pg_res, r, i);
+            if (i == 0) {
+                /* country code */
+                if (value && value[0] == '?') {
+                    break;
+                } else {
+                    k = kh_get(ll_region_map, state->unknown_regions_map,
+                            value);
+                    if (k != kh_end(state->unknown_regions_map)) {
+                        /* shouldn't happen, but whatever... */
+
+                    } else {
+                        k = kh_put(ll_region_map,
+                                state->unknown_regions_map, value, &ret);
+                        if (ret < 0) {
+                            goto lookup_fail;
+                        }
+                        kh_key(state->unknown_regions_map, k) =
+                                strdup(value);
+                        kh_value(state->unknown_regions_map, k) = NULL;
+                    }
+                }
+            } else if (i == 1) {
+                if (k == -1) {
+                    break;
+                }
+                kh_value(state->unknown_regions_map, k) = strdup(value);
+            }
+        }
+    }
+
+    PQclear(pg_res);
+    return 0;
+
+lookup_fail:
+    PQclear(pg_res);
+    return -1;
+}
+
+static int load_region_latlongs(ipmeta_inserter_state_t *state,
+        const char *filename) {
+    io_t *file = NULL;
+    char buffer[BUFFER_LEN];
+    int read;
+    int rc = -1;
+
+    /* connect to metadata db */
+    state->meta_pgconn = PQsetdbLogin(state->meta_psql_host,
+            state->meta_psql_port,
+            NULL, NULL, state->meta_psql_dbname, state->meta_psql_username,
+            state->meta_psql_password);
+    if (PQstatus(state->meta_pgconn) == CONNECTION_BAD) {
+        fprintf(stderr, "failed to connect to IODA metadata database: %s\n",
+                PQerrorMessage(state->meta_pgconn));
+        goto end;
+    }
+
+    if (lookup_unknown_regions(state) < 0) {
+        fprintf(stderr, "failed to fetch unknown region IDs from IODA metadata database\n");
+        goto end;
+    }
+
+    state->regions_map = kh_init(ll_region_map);
+
+    if ((file = wandio_create(filename)) == NULL) {
+        fprintf(stderr, "failed to open file '%s'\n", filename);
+        goto end;
+    }
+    state->first_column = -1;
+    state->current_line = 0;
+    state->parse_row = NULL;
+
+    while (state->first_column < 0) {
+        read = wandio_fgets(file, &buffer, BUFFER_LEN, 0);
+        if (read < 0) {
+            fprintf(stderr, "error reading file: %s\n", filename);
+            goto end;
+        }
+        if (read == 0) {
+            fprintf(stderr, "Empty file: %s\n", filename);
+            goto end;
+        }
+        if (startswith(buffer, "latitude,")) {
+            state->current_column = state->first_column = 0;
+            state->parse_row = parse_ll_region_row;
+        } else {
+            fprintf(stderr, "%s is not a valid region mapping file\n",
+                    filename);
+            goto end;
+        }
+    }
+
+    csv_init(&(state->parser), CSV_STRICT | CSV_REPALL_NL | CSV_STRICT_FINI |
+            CSV_APPEND_NULL | CSV_EMPTY_IS_NULL);
+    while ((read = wandio_read(file, &buffer, BUFFER_LEN)) > 0) {
+        if (csv_parse(&(state->parser), buffer, read, parse_ll_region_cell,
+                state->parse_row, state) != read) {
+            fprintf(stderr, "Error parsing region mapping file\n");
+            fprintf(stderr, "CSV Error: %s\n",
+                 csv_strerror(csv_error(&(state->parser))));
+            goto end;
+        }
+    }
+    if (read < 0) {
+        fprintf(stderr, "Error reading file %s\n", filename);
+        goto end;
+    }
+
+    if (csv_fini(&(state->parser), parse_ll_region_cell, state->parse_row,
+            state) != 0) {
+        fprintf(stderr, "Error parsing region mapping file\n");
+        fprintf(stderr, "CSV Error: %s\n",
+                csv_strerror(csv_error(&(state->parser))));
+        goto end;
+    }
+    rc = 0;
+
+end:
+    csv_free(&(state->parser));
+    wandio_destroy(file);
+    return rc;
+}
+
 static int read_ipinfo_file(ipmeta_inserter_state_t *state,
         const char *filename) {
-    io_t *file;
+    io_t *file = NULL;
     char buffer[BUFFER_LEN];
     int read;
     int rc = -1;
@@ -711,14 +1040,6 @@ static int read_ipinfo_file(ipmeta_inserter_state_t *state,
             NULL);
     if (PQresultStatus(state->insert_upload_stmt) != PGRES_COMMAND_OK) {
         fprintf(stderr, "Preparation of insert upload statement failed: %s\n",
-                PQerrorMessage(state->pgconn));
-        goto end;
-    }
-
-    state->insert_pfx_stmt = PQprepare(state->pgconn, "insert_ipmeta",
-            INSERT_IPINFO_PREFIX_SQL, INSERT_IPINFO_PREFIX_PARAM_COUNT, NULL);
-    if (PQresultStatus(state->insert_pfx_stmt) != PGRES_COMMAND_OK) {
-        fprintf(stderr, "Preparation of insert prefix statement failed: %s\n",
                 PQerrorMessage(state->pgconn));
         goto end;
     }
@@ -770,6 +1091,8 @@ static int read_ipinfo_file(ipmeta_inserter_state_t *state,
     state->first_column = -1;
     state->current_line = 0;
     state->parse_row = NULL;
+    state->rec_lat = NULL;
+    state->rec_long = NULL;
 
     state->timestamp_str = derive_timestamp_from_filename(filename);
     if (state->timestamp_str == NULL) {
@@ -838,12 +1161,13 @@ static int read_ipinfo_file(ipmeta_inserter_state_t *state,
 end:
     csv_free(&(state->parser));
     wandio_destroy(file);
-    PQclear(state->insert_pfx_stmt);
     PQclear(state->insert_upload_stmt);
     PQclear(state->insert_pfx_bounds_stmt);
     PQclear(state->insert_rec_stmt);
     PQclear(state->insert_loc_stmt);
     PQclear(state->select_loc_stmt);
+    PQclear(state->insert_city_stmt);
+    PQclear(state->insert_city_attr_stmt);
     PQfinish(state->pgconn);
     return rc;
 }
@@ -853,6 +1177,10 @@ void free_ipmeta_inserter_state(ipmeta_inserter_state_t *state) {
 
     if (state == NULL) {
         return;
+    }
+
+    if (state->regions_file) {
+        free(state->regions_file);
     }
 
     if (state->locations_file) {
@@ -884,11 +1212,59 @@ void free_ipmeta_inserter_state(ipmeta_inserter_state_t *state) {
         free(state->psql_port);
     }
 
+    if (state->meta_psql_dbname) {
+        free(state->meta_psql_dbname);
+    }
+
+    if (state->meta_psql_username) {
+        free(state->meta_psql_username);
+    }
+
+    if (state->meta_psql_password) {
+        free(state->meta_psql_password);
+    }
+
+    if (state->meta_psql_host) {
+        free(state->meta_psql_host);
+    }
+
+    if (state->meta_psql_port) {
+        free(state->meta_psql_port);
+    }
+
     if (state->country_continent) {
         kh_destroy(u16u16, state->country_continent);
         state->country_continent = NULL;
     }
 
+    if (state->regions_map) {
+        khiter_t k;
+        for (k = 0; k < kh_end(state->regions_map); ++k) {
+            if (kh_exist(state->regions_map, k)) {
+                free((void *)kh_key(state->regions_map, k));
+                free((void *)kh_value(state->regions_map, k));
+            }
+        }
+        kh_destroy(ll_region_map, state->regions_map);
+    }
+
+    if (state->unknown_regions_map) {
+        khiter_t k;
+        for (k = 0; k < kh_end(state->unknown_regions_map); ++k) {
+            if (kh_exist(state->unknown_regions_map, k)) {
+                free((void *)kh_key(state->unknown_regions_map, k));
+                free((void *)kh_value(state->unknown_regions_map, k));
+            }
+        }
+        kh_destroy(ll_region_map, state->unknown_regions_map);
+    }
+
+    if (state->rec_lat) {
+        free(state->rec_lat);
+    }
+    if (state->rec_long) {
+        free(state->rec_long);
+    }
     ipmeta_free_record(state->record);
     free(state);
     return;
@@ -902,10 +1278,16 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
+    if (load_region_latlongs(state, state->regions_file) != 0) {
+        fprintf(stderr, "Failed to parse IODA region mapping file\n");
+        goto endprog;
+    }
+
     if (read_ipinfo_file(state, state->locations_file) != 0) {
         fprintf(stderr, "Failed to parse locations file\n");
     }
 
+endprog:
     free_ipmeta_inserter_state(state);
     return 0;
 }
