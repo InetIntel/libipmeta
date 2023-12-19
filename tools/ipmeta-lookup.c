@@ -341,6 +341,10 @@ int main(int argc, char **argv)
   ipmeta_log(__func__, "done");
 
 quit:
+  if (records != NULL) {
+    ipmeta_record_set_free(&records);
+  }
+
   for (i = 0; i < providers_cnt; i++) {
     if (providers[i] != NULL) {
       free(providers[i]);
@@ -365,10 +369,6 @@ quit:
 
   if (outfile != NULL) {
     wandio_wdestroy(outfile);
-  }
-
-  if (records != NULL) {
-    ipmeta_record_set_free(&records);
   }
 
   /* default rc is -1 */

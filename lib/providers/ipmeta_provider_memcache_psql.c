@@ -79,6 +79,7 @@
 
 KHASH_SET_INIT_STR(str_set)
 KHASH_MAP_INIT_STR(ll_map, double)
+KHASH_MAP_INIT_STR(num_map, uint64_t)
 
 enum {
     IPINFO_PSQL_COLUMN_FIRSTADDR = 0,
@@ -133,6 +134,11 @@ const char *GET_LATEST_TIMESTAMP_SQL =
 #define MAX_CACHE_SIZE (1024 * 1024 * 10)
 #define MORE_CACHED_FLAG "MORE..."
 
+const uint8_t MORE_CACHED_FLAG_BYTES[7] = {
+    0x4D, 0x4F, 0x52, 0x45, 0x2E, 0x2E, 0x2E
+};
+#define MORE_CACHED_FLAG_LEN 7
+
 static ipmeta_provider_t ipmeta_provider_memcache_psql = {
     IPMETA_PROVIDER_MEMCACHE_PSQL, PROVIDER_NAME,
     IPMETA_PROVIDER_GENERATE_PTRS(memcache_psql) };
@@ -185,6 +191,9 @@ typedef struct ipmeta_provider_memcache_psql_state {
 
     /** set of latitudes and longitudes */
     kh_ll_map_t *latlongs;
+
+    /** set of "numbers of IPs" */
+    kh_num_map_t *numips;
 
 #ifdef HAVE_LIBPQ
     PGconn *pgconn;
@@ -370,7 +379,7 @@ static int setup_memcached(ipmeta_provider_memcache_psql_state_t *state) {
     return 0;
 }
 
-static double insert_ll_into_map(char *latlong, kh_ll_map_t **map) {
+static inline double insert_ll_into_map(char *latlong, kh_ll_map_t **map) {
     int ret;
     khiter_t k;
 
@@ -391,7 +400,29 @@ static double insert_ll_into_map(char *latlong, kh_ll_map_t **map) {
     return -1.0;
 }
 
-static char *insert_name_into_set(char *name, kh_str_set_t **set,
+static inline uint64_t insert_number_into_set(char *numstr,
+        kh_num_map_t **map) {
+    int ret;
+    khiter_t k;
+
+    if (numstr == NULL) {
+        return 0;
+    }
+    k = kh_get(num_map, *map, numstr);
+    if (k != kh_end(*map)) {
+        return (uint64_t) kh_value(*map, k);
+    } else {
+        k = kh_put(num_map, *map, numstr, &ret);
+        if (ret >= 0) {
+            kh_key(*map, k) = strdup(numstr);
+            kh_value(*map, k) = (uint64_t) strtol(numstr, NULL, 10);
+            return (uint64_t) kh_value(*map, k);
+        }
+    }
+    return 0;
+}
+
+static inline char *insert_name_into_set(char *name, kh_str_set_t **set,
         uint8_t sanitize_req) {
     int ret;
     char sanitized[1024];
@@ -458,6 +489,7 @@ int ipmeta_provider_memcache_psql_init(ipmeta_provider_t *provider, int argc,
     state->postcodes = kh_init(str_set);
     state->cities = kh_init(str_set);
     state->latlongs = kh_init(ll_map);
+    state->numips = kh_init(num_map);
 
     ipmeta_provider_register_state(provider, state);
     if (parse_args(state, argc, argv) != 0) {
@@ -537,6 +569,15 @@ void ipmeta_provider_memcache_psql_free(ipmeta_provider_t *provider) {
             }
         }
         kh_destroy(ll_map, state->latlongs);
+    }
+
+    if (state->numips) {
+        for (k = 0; k < kh_end(state->numips); ++k) {
+            if (kh_exist(state->numips, k)) {
+                free((void *)kh_key(state->numips, k));
+            }
+        }
+        kh_destroy(num_map, state->numips);
     }
 
 
@@ -710,12 +751,18 @@ static void parse_memcached_cell(void *s, size_t i, void *data) {
 
     switch(state->column_num) {
         case IPINFO_MC_COLUMN_COUNTRY_CODE:
-            if (strcmp(MORE_CACHED_FLAG, tok) == 0) {
-                /* flag to indicate we need to move on to the next page */
-                state->more_cached_records = 1;
-                break;
+            if (tok[2] != '\0') {
+                if (memcmp(MORE_CACHED_FLAG_BYTES, tok, MORE_CACHED_FLAG_LEN)
+                        == 0) {
+                    /* flag to indicate we need to move on to the next page */
+                    state->more_cached_records = 1;
+                    break;
+                } else {
+                    strncpy(state->record->country_code, "??", 2);
+                }
+            } else {
+                strncpy(state->record->country_code, tok, 2);
             }
-            strncpy(state->record->country_code, tok, 2);
             break;
         case IPINFO_MC_COLUMN_CONTINENT_CODE:
             strncpy(state->record->continent_code, tok, 2);
@@ -745,6 +792,8 @@ static void parse_memcached_cell(void *s, size_t i, void *data) {
                     &(state->timezones), 0);
             break;
         case IPINFO_MC_COLUMN_NUMIPS:
+            state->lookup_ip_cnt = insert_number_into_set(tok,
+                    &(state->numips));
             state->lookup_ip_cnt = strtol(tok, NULL, 10);
             break;
         default:
@@ -1154,10 +1203,10 @@ static int lookup_prefix(ipmeta_provider_t *provider,
             add_len = strlen(cache_str);
             /* +2 because we need a \n and a \0 after the more flag */
             if (MAX_CACHE_SIZE - cache_used < add_len +
-                        strlen(MORE_CACHED_FLAG) + 2) {
-                strncpy(state->accum_cache + cache_used, MORE_CACHED_FLAG,
-                        strlen(MORE_CACHED_FLAG));
-                cache_used += strlen(MORE_CACHED_FLAG);
+                        MORE_CACHED_FLAG_LEN + 2) {
+                memcpy(state->accum_cache + cache_used, MORE_CACHED_FLAG_BYTES,
+                        MORE_CACHED_FLAG_LEN);
+                cache_used += MORE_CACHED_FLAG_LEN;
                 state->accum_cache[cache_used] = '\n';
                 state->accum_cache[cache_used + 1] = '\0';
                 cache_used ++;
