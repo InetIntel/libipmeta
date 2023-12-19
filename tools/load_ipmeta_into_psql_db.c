@@ -92,14 +92,14 @@ const char *INSERT_IPMETA_RECORD_SQL =
     "VALUES ($1, $2, $3, $4, $5, $6) RETURNING id";
 
 const char *SELECT_UNKNOWN_REGIONS_META_SQL =
-    "SELECT mddb_entity_attribute.value, mddb_entity.code "
+    "SELECT mddb_entity_attribute.value, mddb_entity.code, mddb_entity.name "
     "FROM mddb_entity JOIN mddb_entity_attribute ON "
     "mddb_entity.id = mddb_entity_attribute.metadata_id "
     "WHERE mddb_entity.name LIKE '%Unknown Region%' AND "
     "mddb_entity_attribute.key = 'country_code'";
 
 const char *SELECT_CITY_NAME_SQL =
-    "SELECT * FROM mddb_entity JOIN mddb_entity_attribute ON "
+    "SELECT mddb_entity.id FROM mddb_entity JOIN mddb_entity_attribute ON "
     "mddb_entity.id = mddb_entity_attribute.metadata_id "
     "WHERE mddb_entity.type_id = 5 AND "
     "mddb_entity.name = $2 AND "
@@ -114,23 +114,38 @@ const char *INSERT_METADATA_CITY_ATTR_SQL =
     "INSERT INTO mddb_entity_attribute (metadata_id, key, value) VALUES "
     "($1, $2, $3)";
 
+const char *LOOKUP_MAX_CITY_CODE_SQL =
+    "SELECT max(code::int) FROM mddb_entity WHERE type_id = 5";
 
 #define INSERT_IPMETA_UPLOAD_PARAM_COUNT 3
 #define INSERT_IPINFO_PREFIX_BOUNDS_PARAM_COUNT 4
 #define INSERT_IPMETA_LOCATION_PARAM_COUNT 5
 #define INSERT_IPMETA_RECORD_PARAM_COUNT 6
 #define SELECT_IPMETA_LOCATION_PARAM_COUNT 4
-#define SELECT_CITY_NAME_PARAM_COUNT = 2
-#define INSERT_METADATA_CITY_PARAM_COUNT = 2
-#define INSERT_METADATA_CITY_ATTR_PARAM_COUNT = 3
+#define SELECT_CITY_NAME_PARAM_COUNT 2
+#define INSERT_METADATA_CITY_PARAM_COUNT 2
+#define INSERT_METADATA_CITY_ATTR_PARAM_COUNT 3
 
 // convert char[2] to uint16_t
 #define c2_to_u16(c2) (((c2)[0] << 8) | (c2)[1])
 
+typedef struct city_lookup {
+    const char **region_codes;
+    const char **city_codes;
+    int used;
+    int alloc;
+} city_lookup_t;
+
+typedef struct ll_region {
+    const char *region_name;
+    const char *region_code;
+} ll_region_t;
+
 KHASH_INIT(u16u16, uint16_t, uint16_t, 1, kh_int_hash_func, kh_int_hash_equal)
 
 KHASH_SET_INIT_STR(str_set)
-KHASH_MAP_INIT_STR(ll_region_map, char *)
+KHASH_MAP_INIT_STR(ll_region_map, ll_region_t)
+KHASH_MAP_INIT_STR(city_map, city_lookup_t *)
 
 // convert uint16_t to char[2]
 #define u16_to_c2(u16, c2)                                                     \
@@ -163,6 +178,7 @@ typedef struct inserter_state {
     PGresult *insert_loc_stmt;
     PGresult *insert_rec_stmt;
     PGresult *select_loc_stmt;
+    PGresult *select_city_stmt;
     PGresult *insert_city_stmt;
     PGresult *insert_city_attr_stmt;
     uint8_t psql_error;
@@ -170,6 +186,7 @@ typedef struct inserter_state {
 
     PGconn *meta_pgconn;
     PGresult *lookup_city_stmt;
+    int next_city_id;
 
     struct csv_parser parser;
     int current_line;
@@ -190,6 +207,7 @@ typedef struct inserter_state {
     khash_t(u16u16) *country_continent;
     khash_t(ll_region_map) *regions_map;
     khash_t(ll_region_map) *unknown_regions_map;
+    khash_t(city_map) *city_codes_map;
 
 } ipmeta_inserter_state_t;
 
@@ -417,13 +435,13 @@ static void parse_ll_region_cell(void *s, size_t i, void *data) {
     char *tok = (char *)s;
     int ret;
     khiter_t k;
+    ll_region_t reg;
 
     switch(state->current_column) {
         case REGION_MAP_LATITUDE:
             state->reg_k = -1;
             break;
         case REGION_MAP_LONGITUDE:
-        case REGION_MAP_REGION_NAME:
         case REGION_MAP_REGION_CODED:
             break;
         case REGION_MAP_LATLONG_STR:
@@ -437,7 +455,9 @@ static void parse_ll_region_cell(void *s, size_t i, void *data) {
                 k = kh_put(ll_region_map, state->regions_map, tok, &ret);
                 if (ret >= 0) {
                     kh_key(state->regions_map, k) = strdup(tok);
-                    kh_value(state->regions_map, k) = 0;
+                    reg.region_code = NULL;
+                    reg.region_name = NULL;
+                    kh_value(state->regions_map, k) = reg;
                     state->reg_k = k;
                 } else {
                     fprintf(stderr, "ERROR: while inserting region map entry for %s\n", tok);
@@ -456,8 +476,24 @@ static void parse_ll_region_cell(void *s, size_t i, void *data) {
                         state->current_line);
                 break;
             }
-            kh_value(state->regions_map, state->reg_k) = strdup(tok);
-            state->reg_k = -1;
+            reg = kh_value(state->regions_map, state->reg_k);
+            reg.region_code = strdup(tok);
+            kh_value(state->regions_map, state->reg_k) = reg;
+            break;
+        case REGION_MAP_REGION_NAME:
+            if (tok == NULL) {
+                fprintf(stderr, "WARNING: no region name on line %u\n",
+                        state->current_line);
+                break;
+            }
+            if (state->reg_k == -1) {
+                fprintf(stderr, "WARNING: no saved latlong key for line %u\n",
+                        state->current_line);
+                break;
+            }
+            reg = kh_value(state->regions_map, state->reg_k);
+            reg.region_name = strdup(tok);
+            kh_value(state->regions_map, state->reg_k) = reg;
             break;
     }
     state->current_column ++;
@@ -593,28 +629,234 @@ static int64_t insert_record_into_psql(ipmeta_inserter_state_t *state,
     return retid;
 }
 
-static char *lookup_region_code(ipmeta_inserter_state_t *state,
-        char *def_label) {
+static const char *insert_new_city(ipmeta_inserter_state_t *state,
+        ll_region_t *reg, char *space) {
+
+    PGresult *ins_res;
+    const char *city_params[INSERT_METADATA_CITY_PARAM_COUNT];
+    const char *attr_params[INSERT_METADATA_CITY_ATTR_PARAM_COUNT];
+    char *cityid = NULL;
+
+    char codestring[32];
+    char fqidstr[256];
+
+    /* city was not in the metadata db, so we should try to add it */
+    assert(state->next_city_id >= 0);
+    snprintf(codestring, 32, "%d", state->next_city_id);
+    city_params[0] = codestring;
+    city_params[1] = state->record->city;
+    state->next_city_id ++;
+
+    ins_res = PQexecPrepared(state->meta_pgconn, "insert_city",
+            INSERT_METADATA_CITY_PARAM_COUNT, city_params, NULL, NULL, 0);
+    if (PQresultStatus(ins_res) == PGRES_TUPLES_OK) {
+        cityid = PQgetvalue(ins_res, 0, 0);
+    } else {
+        fprintf(stderr, "Error while inserting new metadata city: %s\n",
+                PQerrorMessage(state->meta_pgconn));
+    }
+    if (cityid == NULL) {
+        PQclear(ins_res);
+        return NULL;
+    }
+
+    strncpy(space, cityid, 32);
+    PQclear(ins_res);
+    /* insert attributes */
+
+    /* insert fqid */
+    snprintf(fqidstr, 256, "geo.ipinfo.%s.%s.%s.%s",
+            state->record->continent_code, state->record->country_code,
+            reg->region_code, space);
+
+    attr_params[0] = space;
+    attr_params[1] = "fqid";
+    attr_params[2] = fqidstr;
+    ins_res = PQexecPrepared(state->meta_pgconn, "insert_city_attr",
+            INSERT_METADATA_CITY_ATTR_PARAM_COUNT, attr_params, NULL, NULL, 0);
+    if (PQresultStatus(ins_res) != PGRES_COMMAND_OK) {
+        fprintf(stderr,
+                "Error while inserting metadata attribute for new city: %s\n",
+                PQerrorMessage(state->meta_pgconn));
+    }
+    PQclear(ins_res);
+
+    /* insert region code and region name */
+    attr_params[1] = "region_code";
+    attr_params[2] = reg->region_code;
+
+    ins_res = PQexecPrepared(state->meta_pgconn, "insert_city_attr",
+            INSERT_METADATA_CITY_ATTR_PARAM_COUNT, attr_params, NULL, NULL, 0);
+    if (PQresultStatus(ins_res) != PGRES_COMMAND_OK) {
+        fprintf(stderr,
+                "Error while inserting metadata attribute for new city: %s\n",
+                PQerrorMessage(state->meta_pgconn));
+    }
+
+    PQclear(ins_res);
+
+    attr_params[1] = "region_name";
+    attr_params[2] = reg->region_name;
+
+    ins_res = PQexecPrepared(state->meta_pgconn, "insert_city_attr",
+            INSERT_METADATA_CITY_ATTR_PARAM_COUNT, attr_params, NULL, NULL, 0);
+    if (PQresultStatus(ins_res) != PGRES_COMMAND_OK) {
+        fprintf(stderr,
+                "Error while inserting metadata attribute for new city: %s\n",
+                PQerrorMessage(state->meta_pgconn));
+    }
+
+    PQclear(ins_res);
+
+    /* insert country code */
+
+    attr_params[1] = "country_code";
+    attr_params[2] = state->record->country_code;
+
+    ins_res = PQexecPrepared(state->meta_pgconn, "insert_city_attr",
+            INSERT_METADATA_CITY_ATTR_PARAM_COUNT, attr_params, NULL, NULL, 0);
+    if (PQresultStatus(ins_res) != PGRES_COMMAND_OK) {
+        fprintf(stderr,
+                "Error while inserting metadata attribute for new city: %s\n",
+                PQerrorMessage(state->meta_pgconn));
+    }
+
+    PQclear(ins_res);
+
+    /* XXX check if we need country name as well */
+
+    return space;
+}
+
+static const char *lookup_city_code(ipmeta_inserter_state_t *state,
+        ll_region_t *reg) {
+
+    PGresult *pg_res;
+    const char *select_params[SELECT_CITY_NAME_PARAM_COUNT];
+    const char *city_code = NULL;
+    char city_code_space[32];
+    khiter_t k;
+    city_lookup_t *cmap = NULL;
+    int i, khret;
+
+    assert(state->record->city != NULL);
+    assert(reg->region_code != NULL);
+    assert(reg->region_name != NULL);
+
+    /* first try and find in local cache */
+    k = kh_get(city_map, state->city_codes_map, state->record->city);
+    if (k != kh_end(state->city_codes_map)) {
+        cmap = kh_value(state->city_codes_map, k);
+
+        // kh_value(state->city_codes_map, k) is a struct storing an
+        // an array of region codes and an array of corresponding city codes
+        // because a city name is not unique to just one region (e.g.
+        // London, UK vs London, Ontario). Also Singapore is a city that
+        // spans multiple regions.
+        //
+        // if we don't find our region code in the array, then we'll
+        // need to find the city code in the DB and add it to the
+        // array -- so keep the kh_value for this city name because we
+        // can use it later without having to do the lookup again.
+
+        for (i = 0; i < cmap->used; i++) {
+            if (cmap->region_codes[i] == NULL) {
+                break;
+            }
+            if (strcmp(cmap->region_codes[i], reg->region_code) == 0) {
+                city_code = cmap->city_codes[i];
+                break;
+            }
+        }
+    }
+
+    if (city_code != NULL) {
+        return city_code;
+    }
+
+    /* otherwise, try and look up the city name in the metadata database */
+    select_params[0] = reg->region_code;
+    select_params[1] = state->record->city;
+
+    pg_res = PQexecPrepared(state->meta_pgconn, "select_city",
+            SELECT_CITY_NAME_PARAM_COUNT, select_params, NULL, NULL, 0);
+    if (PQresultStatus(pg_res) != PGRES_TUPLES_OK) {
+        fprintf(stderr, "Error while attempting to find city '%s,%s' in the metadata DB\n", state->record->city, reg->region_code);
+        PQclear(pg_res);
+        return NULL;
+    }
+    if (PQntuples(pg_res) != 0) {
+        if (PQntuples(pg_res) > 1) {
+            fprintf(stderr, "WARNING: multiple city entries for %s,%s in metadata DB (using first one... )\n", state->record->city, reg->region_code);
+        }
+
+        city_code = (const char *)PQgetvalue(pg_res, 0, 0);
+    }
+
+    if (city_code == NULL) {
+        memset(city_code_space, 0, 32);
+        city_code = insert_new_city(state, reg, city_code_space);
+        if (city_code == NULL) {
+            return NULL;
+        }
+    }
+
+    /* add to the local city map */
+    if (k == kh_end(state->city_codes_map)) {
+        city_lookup_t *newcity;
+
+        newcity = calloc(1, sizeof(city_lookup_t));
+        k = kh_put(city_map, state->city_codes_map, state->record->city,
+                &khret);
+        kh_key(state->city_codes_map, k) = strdup(state->record->city);
+        kh_value(state->city_codes_map, k) = newcity;
+
+        newcity->region_codes = calloc(16, sizeof(char *));
+        newcity->city_codes = calloc(16, sizeof(char *));
+        newcity->alloc = 16;
+        cmap = newcity;
+    }
+
+    while (cmap->used >= cmap->alloc) {
+        fprintf(stderr, "%s\n", state->record->city);
+        cmap->region_codes = realloc(cmap->region_codes,
+                (cmap->used + 16) * sizeof(char *));
+        cmap->city_codes = realloc(cmap->city_codes,
+                (cmap->used + 16) * sizeof(char *));
+        cmap->alloc += 16;
+    }
+    assert(cmap->used < cmap->alloc);
+    cmap->region_codes[cmap->used] = strdup(reg->region_code);
+    cmap->city_codes[cmap->used] = strdup(city_code);
+    cmap->used ++;
+    return city_code;
+}
+
+static ll_region_t lookup_region_code(ipmeta_inserter_state_t *state) {
 
     char latlong[1024];
     khiter_t k;
+    ll_region_t reg;
 
     if (state->rec_lat != NULL && state->rec_long != NULL) {
         snprintf(latlong, 1024, "%s,%s", state->rec_lat, state->rec_long);
 
         k = kh_get(ll_region_map, state->regions_map, latlong);
         if (k != kh_end(state->regions_map)) {
-            return (char *)kh_value(state->regions_map, k);
+            reg = kh_value(state->regions_map, k);
+            return reg;
         }
     }
 
     k = kh_get(ll_region_map, state->unknown_regions_map,
             state->record->country_code);
     if (k == kh_end(state->unknown_regions_map)) {
-        snprintf(def_label, 1024, "Unknown Region in Unknown Country");
-        return def_label;
+        reg.region_name = NULL;
+        reg.region_code = NULL;
+    } else {
+        reg = kh_value(state->unknown_regions_map, k);
     }
-    return (char *)kh_value(state->unknown_regions_map, k);
+    return reg;
 }
 
 static int64_t insert_location_into_psql(ipmeta_inserter_state_t *state) {
@@ -624,6 +866,7 @@ static int64_t insert_location_into_psql(ipmeta_inserter_state_t *state) {
     int64_t retid = -1;
     char def_region_label[1024];
     char def_city_label[1024];
+    ll_region_t cached_region;
 
     assert(INSERT_IPMETA_LOCATION_PARAM_COUNT >=
             SELECT_IPMETA_LOCATION_PARAM_COUNT);
@@ -631,37 +874,31 @@ static int64_t insert_location_into_psql(ipmeta_inserter_state_t *state) {
     values[0] = state->record->country_code;
     values[1] = state->record->continent_code;
 
-    values[2] = lookup_region_code(state, def_region_label);
-
-    printf("DEVDEBUG: %s %s,%s %s,%s     %s\n",
-            state->record->region ? state->record->region: "No Region"
-            , state->rec_lat, state->rec_long,
-            state->record->city ? state->record->city : "No City",
-            state->record->country_code, values[2]);
-    return 1;
-
-//    values[3] = lookup_city_code(state, def_city_label);
-
-
-    if (state->record->region == NULL) {
-        if (state->record->city) {
-            values[2] = state->record->city;
-        } else {
-            values[2] = "Unknown Region";
-        }
-    } else {
-        values[2] = state->record->region;
+    cached_region = lookup_region_code(state);
+    if (cached_region.region_code == NULL) {
+        cached_region.region_code = "0";
+        cached_region.region_name = "Unknown Region in Unknown Country";
     }
 
+    values[2] = cached_region.region_code;
     if (state->record->city == NULL) {
-        values[3] = "Unknown City";
+        values[3] = NULL;
     } else {
-        values[3] = state->record->city;
+        values[3] = lookup_city_code(state, &cached_region);
+        if (values[3] == NULL) {
+            return -1;
+        }
     }
     values[4] = state->record->timezone;
 
     pg_res = PQexecPrepared(state->pgconn, "select_location",
             SELECT_IPMETA_LOCATION_PARAM_COUNT, values, NULL, NULL, 0);
+    if (PQresultStatus(pg_res) != PGRES_TUPLES_OK) {
+        printf("%s\n", values[3]);
+        fprintf(stderr, "Error while checking if location exists: %s\n",
+                PQerrorMessage(state->pgconn));
+    }
+
     if (PQntuples(pg_res) > 0) {
         retid = strtoll(PQgetvalue(pg_res, 0, 0), NULL, 10);
     } else {
@@ -672,6 +909,7 @@ static int64_t insert_location_into_psql(ipmeta_inserter_state_t *state) {
         } else {
             fprintf(stderr, "Error while inserting new location entry: %s\n",
                     PQerrorMessage(state->pgconn));
+            assert(0);
         }
         PQclear(ins_res);
     }
@@ -689,6 +927,9 @@ static int insert_pfx_into_psql(ipmeta_inserter_state_t *state,
     char firststr[INET_ADDRSTRLEN + 4];
     char laststr[INET_ADDRSTRLEN + 4];
 
+    char firstnum[128];
+    char lastnum[128];
+
     char rec_id_str[32];
     int ret = 0;
 
@@ -698,12 +939,9 @@ static int insert_pfx_into_psql(ipmeta_inserter_state_t *state,
     }
 
     ipvx_first_addr(&(pfx_node->prefix), &res);
-    if (ipvx_ntop_pfx(&res, firststr) == NULL) {
-        fprintf(stderr, "Unable to convert ipvx first addr to string\n");
-        return -1;
-    }
-
+    snprintf(firstnum, 128, "%u", ntohl(res.addr.v4.s_addr));
     ipvx_last_addr(&(pfx_node->prefix), &res);
+    snprintf(lastnum, 128, "%u", ntohl(res.addr.v4.s_addr));
     if (ipvx_ntop_pfx(&res, laststr) == NULL) {
         fprintf(stderr, "Unable to convert ipvx last addr to string\n");
         return -1;
@@ -713,8 +951,8 @@ static int insert_pfx_into_psql(ipmeta_inserter_state_t *state,
 
     bounds_values[0] = rec_id_str;
     bounds_values[1] = pfxstr;
-    bounds_values[2] = firststr;
-    bounds_values[3] = laststr;
+    bounds_values[2] = firstnum;
+    bounds_values[3] = lastnum;
 
     pg_res = PQexecPrepared(state->pgconn, "insert_pfx_bounds",
             INSERT_IPINFO_PREFIX_BOUNDS_PARAM_COUNT, bounds_values,
@@ -811,7 +1049,6 @@ static void parse_ipinfo_row(int c, void *data) {
     }
 
     loc_id = insert_location_into_psql(state);
-    goto rowdone;       // TODO REMOVE
     if (loc_id <= 0) {
         state->psql_error = 1;
         goto rowdone;
@@ -824,6 +1061,9 @@ static void parse_ipinfo_row(int c, void *data) {
     }
 
     for (pfx_node = pfx_list; pfx_node != NULL; pfx_node = pfx_node->next) {
+        if (pfx_node->prefix.family != AF_INET) {
+            continue;
+        }
         // do insertion here
         if (insert_pfx_into_psql(state, pfx_node, rec_id) < 0) {
             state->psql_error = 1;
@@ -878,6 +1118,7 @@ static int lookup_unknown_regions(ipmeta_inserter_state_t *state) {
     int r, i, ret;
     khiter_t k;
     char *value;
+    ll_region_t reg;
 
     pg_res = PQexec(state->meta_pgconn, SELECT_UNKNOWN_REGIONS_META_SQL);
     if (PQresultStatus(pg_res) == PGRES_FATAL_ERROR) {
@@ -894,7 +1135,7 @@ static int lookup_unknown_regions(ipmeta_inserter_state_t *state) {
     state->unknown_regions_map = kh_init(ll_region_map);
     for (r = 0; r < PQntuples(pg_res); r++) {
         k = -1;
-        for (i = 0; i < 2; i++) {
+        for (i = 0; i < 3; i++) {
             value = PQgetvalue(pg_res, r, i);
             if (i == 0) {
                 /* country code */
@@ -914,19 +1155,53 @@ static int lookup_unknown_regions(ipmeta_inserter_state_t *state) {
                         }
                         kh_key(state->unknown_regions_map, k) =
                                 strdup(value);
-                        kh_value(state->unknown_regions_map, k) = NULL;
+                        reg.region_code = NULL;
+                        reg.region_name = NULL;
                     }
                 }
             } else if (i == 1) {
                 if (k == -1) {
                     break;
                 }
-                kh_value(state->unknown_regions_map, k) = strdup(value);
+                reg.region_code = strdup(value);
+            } else if (i == 2) {
+                if (k == -1) {
+                    break;
+                }
+                reg.region_name = strdup(value);
             }
+        }
+        if (k != -1) {
+            kh_value(state->unknown_regions_map, k) = reg;
         }
     }
 
     PQclear(pg_res);
+
+    pg_res = PQexec(state->meta_pgconn, LOOKUP_MAX_CITY_CODE_SQL);
+    if (PQresultStatus(pg_res) == PGRES_FATAL_ERROR) {
+        fprintf(stderr, "Execution of max city code lookup failed: %s\n",
+                PQresultErrorMessage(pg_res));
+        goto lookup_fail;
+    } else if (PQresultStatus(pg_res) != PGRES_TUPLES_OK) {
+        fprintf(stderr,
+                "Non fatal error when executing max city code lookup: %d %s\n",
+                PQresultStatus(pg_res), PQresultErrorMessage(pg_res));
+        goto lookup_fail;
+    }
+
+    if (PQntuples(pg_res) <= 0) {
+        state->next_city_id = 0;
+    } else {
+        value = PQgetvalue(pg_res, 0, 0);
+        if (value == NULL || strlen(value) == 0) {
+            state->next_city_id = 0;
+        } else {
+            state->next_city_id = strtoul(value, NULL, 10) + 1;
+        }
+    }
+    PQclear(pg_res);
+
     return 0;
 
 lookup_fail:
@@ -958,6 +1233,7 @@ static int load_region_latlongs(ipmeta_inserter_state_t *state,
     }
 
     state->regions_map = kh_init(ll_region_map);
+    state->city_codes_map = kh_init(city_map);
 
     if ((file = wandio_create(filename)) == NULL) {
         fprintf(stderr, "failed to open file '%s'\n", filename);
@@ -1032,6 +1308,32 @@ static int read_ipinfo_file(ipmeta_inserter_state_t *state,
     if (PQstatus(state->pgconn) == CONNECTION_BAD) {
         fprintf(stderr, "failed to connect to PSQL database: %s\n",
                 PQerrorMessage(state->pgconn));
+        goto end;
+    }
+
+    state->select_city_stmt = PQprepare(state->meta_pgconn, "select_city",
+            SELECT_CITY_NAME_SQL, SELECT_CITY_NAME_PARAM_COUNT, NULL);
+    if (PQresultStatus(state->select_city_stmt) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "Preparation of lookup city statement failed: %s\n",
+                PQerrorMessage(state->meta_pgconn));
+        goto end;
+    }
+
+    state->insert_city_stmt = PQprepare(state->meta_pgconn, "insert_city",
+            INSERT_METADATA_CITY_SQL, INSERT_METADATA_CITY_PARAM_COUNT, NULL);
+    if (PQresultStatus(state->insert_city_stmt) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "Preparation of insert city statement failed: %s\n",
+                PQerrorMessage(state->meta_pgconn));
+        goto end;
+    }
+
+    state->insert_city_attr_stmt = PQprepare(state->meta_pgconn,
+            "insert_city_attr", INSERT_METADATA_CITY_ATTR_SQL,
+            INSERT_METADATA_CITY_ATTR_PARAM_COUNT, NULL);
+    if (PQresultStatus(state->insert_city_attr_stmt) != PGRES_COMMAND_OK) {
+        fprintf(stderr,
+                "Preparation of insert city attr statement failed: %s\n",
+                PQerrorMessage(state->meta_pgconn));
         goto end;
     }
 
@@ -1167,6 +1469,7 @@ end:
     PQclear(state->insert_loc_stmt);
     PQclear(state->select_loc_stmt);
     PQclear(state->insert_city_stmt);
+    PQclear(state->select_city_stmt);
     PQclear(state->insert_city_attr_stmt);
     PQfinish(state->pgconn);
     return rc;
@@ -1174,6 +1477,9 @@ end:
 
 void free_ipmeta_inserter_state(ipmeta_inserter_state_t *state) {
     khiter_t k;
+    int i;
+    city_lookup_t *cmap;
+    ll_region_t reg;
 
     if (state == NULL) {
         return;
@@ -1238,22 +1544,51 @@ void free_ipmeta_inserter_state(ipmeta_inserter_state_t *state) {
     }
 
     if (state->regions_map) {
-        khiter_t k;
         for (k = 0; k < kh_end(state->regions_map); ++k) {
             if (kh_exist(state->regions_map, k)) {
                 free((void *)kh_key(state->regions_map, k));
-                free((void *)kh_value(state->regions_map, k));
+                reg = kh_value(state->regions_map, k);
+
+                if (reg.region_name) {
+                    free((void *)reg.region_name);
+                }
+                if (reg.region_code) {
+                    free((void *)reg.region_code);
+                }
             }
         }
         kh_destroy(ll_region_map, state->regions_map);
     }
 
+    if (state->city_codes_map) {
+        for (k = 0; k < kh_end(state->city_codes_map); ++k) {
+            if (kh_exist(state->city_codes_map, k)) {
+                cmap = kh_value(state->city_codes_map, k);
+                for (i = 0; i < cmap->used; i++) {
+                    free((void *)cmap->region_codes[i]);
+                    free((void *)cmap->city_codes[i]);
+                }
+                free(cmap->region_codes);
+                free(cmap->city_codes);
+                free((void *)kh_key(state->city_codes_map, k));
+                free(cmap);
+            }
+        }
+        kh_destroy(city_map, state->city_codes_map);
+    }
+
     if (state->unknown_regions_map) {
-        khiter_t k;
         for (k = 0; k < kh_end(state->unknown_regions_map); ++k) {
             if (kh_exist(state->unknown_regions_map, k)) {
                 free((void *)kh_key(state->unknown_regions_map, k));
-                free((void *)kh_value(state->unknown_regions_map, k));
+                reg = kh_value(state->unknown_regions_map, k);
+
+                if (reg.region_name) {
+                    free((void *)reg.region_name);
+                }
+                if (reg.region_code) {
+                    free((void *)reg.region_code);
+                }
             }
         }
         kh_destroy(ll_region_map, state->unknown_regions_map);
@@ -1273,6 +1608,7 @@ void free_ipmeta_inserter_state(ipmeta_inserter_state_t *state) {
 int main(int argc, char *argv[]) {
     ipmeta_inserter_state_t *state = calloc(1, sizeof(ipmeta_inserter_state_t));
 
+    state->next_city_id = -1;
     if (parse_args(state, argc, argv) < 0) {
         fprintf(stderr, "Failed to parse arguments... exiting\n");
         return -1;
