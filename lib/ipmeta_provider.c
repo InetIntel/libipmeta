@@ -55,6 +55,9 @@
 /* netacq edge */
 #include "ipmeta_provider_netacq_edge.h"
 
+/* ipinfo */
+#include "ipmeta_provider_ipinfo.h"
+
 #if 0
 /* netacq legacy */
 #include "ipmeta_provider_netacq.h"
@@ -76,34 +79,51 @@ static const provider_alloc_func_t provider_alloc_functions[] = {
   ipmeta_provider_maxmind_alloc,
   ipmeta_provider_netacq_edge_alloc,
   ipmeta_provider_pfx2as_alloc,
+  ipmeta_provider_ipinfo_alloc,
 };
 
-void ipmeta_free_record(ipmeta_record_t *record)
+void ipmeta_clean_record(ipmeta_record_t *record)
 {
   if (record == NULL) {
     return;
   }
 
-  free(record->region);
-  record->region = NULL;
+  if (record->region) {
+    free(record->region);
+  }
 
-  free(record->city);
-  record->city = NULL;
+  if (record->city) {
+    free(record->city);
+  }
 
-  free(record->post_code);
-  record->post_code = NULL;
+  if (record->post_code) {
+    free(record->post_code);
+  }
 
-  free(record->conn_speed);
-  record->conn_speed = NULL;
+  if (record->conn_speed) {
+    free(record->conn_speed);
+  }
 
-  free(record->polygon_ids);
-  record->polygon_ids = NULL;
+  if (record->polygon_ids) {
+    free(record->polygon_ids);
+  }
 
-  free(record->asn);
-  record->asn = NULL;
-  record->asn_cnt = 0;
+  if (record->asn) {
+    free(record->asn);
+  }
 
-  free(record);
+  if (record->timezone) {
+    free(record->timezone);
+  }
+
+  memset(record, 0, sizeof(ipmeta_record_t));
+}
+
+void ipmeta_free_record(ipmeta_record_t *record) {
+  if (record) {
+    ipmeta_clean_record(record);
+    free(record);
+  }
   return;
 }
 
@@ -182,7 +202,6 @@ void ipmeta_provider_free(ipmeta_t *ipmeta, ipmeta_provider_t *provider)
 {
   assert(ipmeta != NULL);
   assert(provider != NULL);
-
   /* only free everything if we were enabled */
   if (provider->enabled != 0) {
     /* ask the provider to free it's own state */
@@ -194,7 +213,8 @@ void ipmeta_provider_free(ipmeta_t *ipmeta, ipmeta_provider_t *provider)
     /* free the records hash */
     if (provider->all_records != NULL) {
       /* this is where the records are free'd */
-      kh_free_vals(ipmeta_rechash, provider->all_records, ipmeta_free_record);
+      kh_free_vals(ipmeta_rechash, provider->all_records,
+            provider->free_record);
       kh_destroy(ipmeta_rechash, provider->all_records);
       provider->all_records = NULL;
     }
