@@ -108,23 +108,15 @@ typedef struct ipmeta_provider_ipinfo_state {
     int rec_prefix_count;
 
     ipvx_prefix_t block_lower_first;
+    ipvx_prefix_t block_upper_last;
 
     const char *current_filename;
 
     /** map from country to continent */
     khash_t(u16u16) *country_continent;
 
-    /** set of timezone strings */
-    kh_str_set_t *timezones;
-
-    /** set of region name strings */
+    /** set of region ID strings */
     kh_str_set_t *regions;
-
-    /** set of city name strings */
-    kh_str_set_t *cities;
-
-    /** set of postcode strings */
-    kh_str_set_t *postcodes;
 
 } ipmeta_provider_ipinfo_state_t;
 
@@ -132,14 +124,8 @@ typedef struct ipmeta_provider_ipinfo_state {
 typedef enum column_list {
     LOCATION_COL_STARTIP,       ///< Range Start IP
     LOCATION_COL_ENDIP,         ///< Range End IP
-    LOCATION_COL_JOINKEY,       ///< Join key (ignored)
-    LOCATION_COL_CITY,          ///< City String
     LOCATION_COL_REGION,        ///< Region String
     LOCATION_COL_COUNTRY,       ///< 2 Char Country Code
-    LOCATION_COL_LAT,           ///< Latitude
-    LOCATION_COL_LONG,          ///< Longitude
-    LOCATION_COL_POSTCODE,      ///< Postal Code String
-    LOCATION_COL_TZ,            ///< Time Zone
     LOCATION_COL_ENDCOL,        ///< 1 past the last column ID
 } location_cols_t;
 
@@ -147,7 +133,7 @@ typedef enum column_list {
 static void usage(ipmeta_provider_t *provider) {
     fprintf(stderr,
         "provider usage: %s -l locations\n"
-        "    -l <file>  The file containing the location data\n",
+        "    -l <file>  The file containing the pre-processed location data\n",
         provider->name);
 }
 
@@ -234,7 +220,7 @@ static void insert_ipinfo_record(ipmeta_provider_t *provider,
     }
 
     if (state->block_lower_first.family == AF_UNSPEC ||
-            state->block_upper.family == AF_UNSPEC) {
+            state->block_upper_last.family == AF_UNSPEC) {
         goto insdone;
     }
 
@@ -248,8 +234,8 @@ static void insert_ipinfo_record(ipmeta_provider_t *provider,
 
     ipmeta_provider_insert_record(provider, state->record);
 
-    if (ipvx_range_to_prefix(&state->block_lower_first, &state->block_upper,
-            &pfx_list) != 0) {
+    if (ipvx_range_to_prefix(&state->block_lower_first,
+            &state->block_upper_last, &pfx_list) != 0) {
         row_error(state, "%s", "Could not convert IP range to prefixes");
     }
     if (pfx_list == NULL) {
@@ -272,6 +258,8 @@ insdone:
     state->rec_prefix_count = 0;
 
     memcpy(&(state->block_lower_first), &(state->block_lower),
+            sizeof(ipvx_prefix_t));
+    memcpy(&(state->block_upper_last), &(state->block_upper),
             sizeof(ipvx_prefix_t));
 }
 
@@ -356,10 +344,6 @@ static void parse_ipinfo_cell(void *s, size_t i, void *data) {
             rec->country_code[0] = cc[0];
             rec->country_code[1] = cc[1];
             break;
-        case LOCATION_COL_CITY:
-            //rec->city = insert_name_into_set(tok, &(state->cities));
-            rec->city = NULL;
-            break;
         case LOCATION_COL_REGION:
             region = insert_name_into_set(tok, &(state->regions));
             if (state->rec_prefix_count > 0) {
@@ -373,38 +357,6 @@ static void parse_ipinfo_cell(void *s, size_t i, void *data) {
             }
             rec->region = region;
             break;
-        case LOCATION_COL_POSTCODE:
-            //rec->post_code = insert_name_into_set(tok, &(state->postcodes));
-            rec->post_code = NULL;
-            break;
-        case LOCATION_COL_TZ:
-            rec->timezone = NULL;
-            //rec->timezone = insert_name_into_set(tok, &(state->timezones));
-            break;
-        case LOCATION_COL_LAT:
-            /*
-            if (tok && *tok) {
-                rec->latitude = strtod(tok, &end);
-                if (end == tok || *end || rec->latitude < -90 ||
-                        rec->latitude > 90) {
-                    col_invalid(state, "Invalid latitude", tok);
-                }
-            }
-            */
-            break;
-        case LOCATION_COL_LONG:
-            /*
-            if (tok && *tok) {
-                rec->longitude = strtod(tok, &end);
-                if (end == tok || *end || rec->longitude < -180 ||
-                        rec->longitude > 180) {
-                    col_invalid(state, "Invalid longitude", tok);
-                }
-            }
-            */
-            break;
-        case LOCATION_COL_JOINKEY:
-            break; // unused
         default:
             col_invalid(state, "Unexpected trailing column", tok);
     }
@@ -422,6 +374,8 @@ static void parse_ipinfo_row(int c, void *data) {
     state->current_line ++;
     state->current_column = 0;
 
+    memcpy(&(state->block_upper_last), &(state->block_upper),
+            sizeof(ipvx_prefix_t));
     return;
 }
 
@@ -464,10 +418,7 @@ static int read_ipinfo_file(ipmeta_provider_t *provider, const char *filename) {
     state->current_line = 0;
     state->parse_row = NULL;
 
-    state->timezones = kh_init(str_set);
     state->regions = kh_init(str_set);
-    state->postcodes = kh_init(str_set);
-    state->cities = kh_init(str_set);
 
     while (state->first_column < 0) {
         read = wandio_fgets(file, &buffer, BUFFER_LEN, 0);
@@ -574,15 +525,6 @@ void ipmeta_provider_ipinfo_free(ipmeta_provider_t *provider) {
             state->locations_file = NULL;
         }
 
-        if (state->timezones) {
-            for (k = 0; k < kh_end(state->timezones); ++k) {
-                if (kh_exist(state->timezones, k)) {
-                    free((void *)kh_key(state->timezones, k));
-                }
-            }
-            kh_destroy(str_set, state->timezones);
-        }
-
         if (state->regions) {
             for (k = 0; k < kh_end(state->regions); ++k) {
                 if (kh_exist(state->regions, k)) {
@@ -592,23 +534,6 @@ void ipmeta_provider_ipinfo_free(ipmeta_provider_t *provider) {
             kh_destroy(str_set, state->regions);
         }
 
-        if (state->cities) {
-            for (k = 0; k < kh_end(state->cities); ++k) {
-                if (kh_exist(state->cities, k)) {
-                    free((void *)kh_key(state->cities, k));
-                }
-            }
-            kh_destroy(str_set, state->cities);
-        }
-
-        if (state->postcodes) {
-            for (k = 0; k < kh_end(state->postcodes); ++k) {
-                if (kh_exist(state->postcodes, k)) {
-                    free((void *)kh_key(state->postcodes, k));
-                }
-            }
-            kh_destroy(str_set, state->postcodes);
-        }
 
         if (state->country_continent) {
             kh_destroy(u16u16, state->country_continent);
