@@ -80,16 +80,29 @@ ipmeta_t *ipmeta_init(enum ipmeta_ds_id dstype)
     return NULL;
   }
   ipmeta_log(__func__, "using datastore %s", ipmeta->datastore->name);
-
+  for (i = 0; i < IPMETA_GEO_DETAIL_LAST; i++) {
+    ipmeta->fqid_caches[i] = kh_init(fqid_hash);
+  }
   return ipmeta;
 }
 
 void ipmeta_free(ipmeta_t *ipmeta)
 {
   int i;
+  khiter_t k;
 
   /* no mercy for double frees */
   assert(ipmeta != NULL);
+
+  for (i = 0; i < IPMETA_GEO_DETAIL_LAST; i++) {
+    for (k = 0; k < kh_end(ipmeta->fqid_caches[i]); ++k) {
+      if (kh_exist(ipmeta->fqid_caches[i], k)) {
+        free((void *)kh_key(ipmeta->fqid_caches[i], k));
+        free((void *)kh_value(ipmeta->fqid_caches[i], k));
+      }
+    }
+    kh_destroy(fqid_hash, ipmeta->fqid_caches[i]);
+  }
 
   /* loop across all providers and free each one */
   for (i = 0; i < IPMETA_PROVIDER_MAX; i++) {
@@ -383,6 +396,118 @@ void ipmeta_dump_record_header()
   ipmeta_write_record_header(NULL);
 }
 
+const char *ipmeta_derive_geo_fqid_from_record(ipmeta_t *ipmeta,
+        ipmeta_record_t *record, ipmeta_detail_t level) {
+
+    char *fqid = NULL;
+    char *ptr;
+    khiter_t k;
+    char *key = NULL;
+    int ret;
+
+    if (record->source == IPMETA_PROVIDER_PFX2AS) {
+        return NULL;
+    }
+
+    switch(level) {
+        case IPMETA_GEO_DETAIL_CONTINENT:
+            key = record->continent_code;
+            break;
+        case IPMETA_GEO_DETAIL_COUNTRY:
+            key = record->country_code;
+            break;
+        case IPMETA_GEO_DETAIL_REGION:
+            key = record->region;
+            break;
+        case IPMETA_GEO_DETAIL_CITY:
+            key = record->city;
+            break;
+    }
+
+    if (key == NULL) {
+        return NULL;
+    }
+
+    if (ipmeta) {
+        /* See if we've already derived and cached the fqid for this
+         * particular record's location
+         */
+        k = kh_get(fqid_hash, ipmeta->fqid_caches[level], key);
+        if (k != kh_end(ipmeta->fqid_caches[level])) {
+            fqid = (char *) kh_value(ipmeta->fqid_caches[level], k);
+        }
+    }
+
+    if (fqid) {
+        return (const char *)fqid;
+    }
+
+    fqid = (char *)calloc(256, sizeof(char));
+    if (fqid == NULL) {
+        return NULL;
+    }
+    ptr = fqid;
+
+    if (level >= IPMETA_GEO_DETAIL_CONTINENT) {
+        memcpy(ptr, record->continent_code, 2);
+        ptr += 2;
+    }
+
+    if (level >= IPMETA_GEO_DETAIL_COUNTRY) {
+        *ptr = '.';
+        ptr ++;
+
+        memcpy(ptr, record->country_code, 2);
+        ptr += 2;
+    }
+
+    if (level >= IPMETA_GEO_DETAIL_REGION) {
+        if (record->region == NULL) {
+            free(fqid);
+            return NULL;
+        }
+        *ptr = '.';
+        ptr ++;
+
+        if (strlen(record->region) > (255 - (ptr - fqid))) {
+            /* not enough room */
+            free(fqid);
+            return NULL;
+        }
+
+        memcpy(ptr, record->region, strlen(record->region));
+        ptr += strlen(record->region);
+    }
+
+    if (level >= IPMETA_GEO_DETAIL_CITY) {
+        if (record->city == NULL) {
+            free(fqid);
+            return NULL;
+        }
+        *ptr = '.';
+        ptr ++;
+
+        if (strlen(record->city) > (255 - (ptr - fqid))) {
+            /* not enough room */
+            free(fqid);
+            return NULL;
+        }
+        memcpy(ptr, record->city, strlen(record->city));
+        ptr += strlen(record->city);
+    }
+
+    if (ipmeta) {
+        /* cache this fqid */
+        k = kh_put(fqid_hash, ipmeta->fqid_caches[level], key, &ret);
+        if (ret >= 0) {
+            kh_key(ipmeta->fqid_caches[level], k) = strdup(key);
+            kh_value(ipmeta->fqid_caches[level], k) = fqid;
+        }
+    }
+
+    return (const char *)fqid;
+}
+
 void ipmeta_write_record(iow_t *file, ipmeta_record_t *record, char *ip_str,
                          uint64_t num_ips)
 {
@@ -424,6 +549,7 @@ void ipmeta_write_record(iow_t *file, ipmeta_record_t *record, char *ip_str,
     } else {
       ipmeta_printf(file, "|");
     }
+
     ipmeta_printf(file,
              "%s" SEPARATOR "%d" "\n",
              record->timezone == NULL ? "" : record->timezone,

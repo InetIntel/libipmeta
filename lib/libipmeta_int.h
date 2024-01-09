@@ -51,6 +51,8 @@
 
 KHASH_MAP_INIT_INT(ipmeta_rechash, struct ipmeta_record *)
 
+KHASH_MAP_INIT_STR(fqid_hash, const char *)
+
 /**
  * @name Internal Datastructures
  *
@@ -70,6 +72,8 @@ struct ipmeta {
   struct ipmeta_ds *datastore;
 
   uint32_t all_provmask;
+
+  kh_fqid_hash_t *fqid_caches[IPMETA_GEO_DETAIL_LAST];
 };
 
 /** Structure which holds a set of records, returned by a query */

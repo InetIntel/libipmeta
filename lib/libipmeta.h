@@ -100,6 +100,14 @@ typedef enum ipmeta_provider_id {
 
 } ipmeta_provider_id_t;
 
+typedef enum ipmeta_detail {
+    IPMETA_GEO_DETAIL_CONTINENT = 2,
+    IPMETA_GEO_DETAIL_COUNTRY = 3,
+    IPMETA_GEO_DETAIL_REGION = 4,
+    IPMETA_GEO_DETAIL_CITY = 5,
+    IPMETA_GEO_DETAIL_LAST,
+} ipmeta_detail_t;
+
 /** A unique identifier for each metadata ds that libipmeta supports.
  *
  * @note When adding a datastructure to this list, there must also be a
@@ -529,6 +537,29 @@ void ipmeta_write_record(iow_t *file, ipmeta_record_t *record, char *ip_str,
  * order as the contents are written out when using ipmeta_write_record.
  */
 void ipmeta_write_record_header(iow_t *file);
+
+/** Derives a suitable FQID for the location described by the given
+ *  ipmeta record.
+ *
+ *  @param ipmeta   An ipmeta instance. If not NULL, the derived FQID will
+ *                  be cached to speed up future calls to this method for
+ *                  the same location.
+ *  @param record   The record to get an FQID for.
+ *  @param level    The level of geographic detail that the FQID must provide
+ *
+ *  @return a string containing the desired FQID, or NULL if there was
+ *          insufficient detail in the record to produce the requested FQID.
+ *
+ *  @note VERY IMPORTANT: if the caller provides NULL as the ipmeta parameter,
+ *        then the caller MUST free the returned string when they are finished
+ *        with it. If the ipmeta parameter is NOT NULL, then the caller MUST
+ *        NOT free the FQID string, as the ipmeta instance will handle that
+ *        when it is destroyed.
+ *  @note this method will return NULL if called on a record with no
+ *        geographic information (i.e. only ASN data).
+ */
+const char *ipmeta_derive_geo_fqid_from_record(ipmeta_t *ipmeta,
+        ipmeta_record_t *record, ipmeta_detail_t level);
 
 /** Get an array of all the metadata records registered with the given
  *  provider
