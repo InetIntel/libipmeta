@@ -233,6 +233,9 @@ static void insert_ipinfo_record(ipmeta_provider_t *provider,
     u16_to_c2(cont, state->record->continent_code);
 
     ipmeta_provider_insert_record(provider, state->record);
+    /* pre-cache record FQIDs for faster future lookup */
+    ipmeta_derive_geo_fqid_from_record(provider, state->record,
+            IPMETA_GEO_DETAIL_REGION);
 
     if (ipvx_range_to_prefix(&state->block_lower_first,
             &state->block_upper_last, &pfx_list) != 0) {
