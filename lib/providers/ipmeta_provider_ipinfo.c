@@ -227,10 +227,42 @@ static void insert_ipinfo_record(ipmeta_provider_t *provider,
     char *cc = state->record->country_code;
     if ((khiter = kh_get(u16u16, state->country_continent, c2_to_u16(cc))) ==
             kh_end(state->country_continent)) {
-        row_error(state, "Unknown country code (%s)", cc);
+        fprintf(stderr, "ERROR: Unknown country code (%s)\n", cc);
+        goto insdone;
     }
     uint16_t cont = kh_value(state->country_continent, khiter);
     u16_to_c2(cont, state->record->continent_code);
+
+    /* store the numeric equivalent of the region code
+     *
+     * consider caching if start-up performance is an issue due to
+     * repeated string-to-integer conversions XXX
+     */
+    if (state->record->region) {
+        char *endptr;
+        unsigned long conv = strtoul(state->record->region, &endptr, 10);
+        if ((errno == ERANGE && (conv == ULONG_MAX || conv == 0)) ||
+                (errno != 0 && conv == 0)) {
+            fprintf(stderr,
+                "ERROR: strtoul failure (input was '%s')\n",
+                state->record->region);
+            goto insdone;
+        }
+
+        if (endptr == state->record->region) {
+            fprintf(stderr,
+                "ERROR: region must be a valid numeric identifier (not '%s')\n",
+                state->record->region);
+            goto insdone;
+        }
+
+        if (conv > UINT16_MAX) {
+            fprintf(stderr,
+                "ERROR: region code was unexpectedly large: %lu\n", conv);
+            goto insdone;
+        }
+        state->record->region_code = (uint16_t)conv;
+    }
 
     ipmeta_provider_insert_record(provider, state->record);
     /* pre-cache record FQIDs for faster future lookup */
@@ -239,7 +271,8 @@ static void insert_ipinfo_record(ipmeta_provider_t *provider,
 
     if (ipvx_range_to_prefix(&state->block_lower_first,
             &state->block_upper_last, &pfx_list) != 0) {
-        row_error(state, "%s", "Could not convert IP range to prefixes");
+        fprintf(stderr, "%s\n", "Could not convert IP range to prefixes");
+        goto insdone;
     }
     if (pfx_list == NULL) {
         goto insdone;
@@ -249,7 +282,8 @@ static void insert_ipinfo_record(ipmeta_provider_t *provider,
         if (ipmeta_provider_associate_record(provider,
                 pfx_node->prefix.family, &(pfx_node->prefix.addr),
                 pfx_node->prefix.masklen, state->record) != 0) {
-            row_error(state, "%s", "Failed to associate record with prefix");
+            fprintf(stderr, "%s\n", "Failed to associate record with prefix");
+            goto insdone;
         }
     }
     ipvx_prefix_list_free(pfx_list);
