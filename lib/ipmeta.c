@@ -80,29 +80,15 @@ ipmeta_t *ipmeta_init(enum ipmeta_ds_id dstype)
     return NULL;
   }
   ipmeta_log(__func__, "using datastore %s", ipmeta->datastore->name);
-  for (i = 0; i < IPMETA_GEO_DETAIL_LAST; i++) {
-    ipmeta->fqid_caches[i] = kh_init(fqid_hash);
-  }
   return ipmeta;
 }
 
 void ipmeta_free(ipmeta_t *ipmeta)
 {
   int i;
-  khiter_t k;
 
   /* no mercy for double frees */
   assert(ipmeta != NULL);
-
-  for (i = 0; i < IPMETA_GEO_DETAIL_LAST; i++) {
-    for (k = 0; k < kh_end(ipmeta->fqid_caches[i]); ++k) {
-      if (kh_exist(ipmeta->fqid_caches[i], k)) {
-        free((void *)kh_key(ipmeta->fqid_caches[i], k));
-        free((void *)kh_value(ipmeta->fqid_caches[i], k));
-      }
-    }
-    kh_destroy(fqid_hash, ipmeta->fqid_caches[i]);
-  }
 
   /* loop across all providers and free each one */
   for (i = 0; i < IPMETA_PROVIDER_MAX; i++) {
@@ -396,7 +382,7 @@ void ipmeta_dump_record_header()
   ipmeta_write_record_header(NULL);
 }
 
-const char *ipmeta_derive_geo_fqid_from_record(ipmeta_t *ipmeta,
+const char *ipmeta_derive_geo_fqid_from_record(ipmeta_provider_t *provider,
         ipmeta_record_t *record, ipmeta_detail_t level) {
 
     char *fqid = NULL;
@@ -428,13 +414,13 @@ const char *ipmeta_derive_geo_fqid_from_record(ipmeta_t *ipmeta,
         return NULL;
     }
 
-    if (ipmeta) {
+    if (provider) {
         /* See if we've already derived and cached the fqid for this
          * particular record's location
          */
-        k = kh_get(fqid_hash, ipmeta->fqid_caches[level], key);
-        if (k != kh_end(ipmeta->fqid_caches[level])) {
-            fqid = (char *) kh_value(ipmeta->fqid_caches[level], k);
+        k = kh_get(fqid_hash, provider->fqid_caches[level], key);
+        if (k != kh_end(provider->fqid_caches[level])) {
+            fqid = (char *) kh_value(provider->fqid_caches[level], k);
         }
     }
 
@@ -496,12 +482,12 @@ const char *ipmeta_derive_geo_fqid_from_record(ipmeta_t *ipmeta,
         ptr += strlen(record->city);
     }
 
-    if (ipmeta) {
+    if (provider) {
         /* cache this fqid */
-        k = kh_put(fqid_hash, ipmeta->fqid_caches[level], key, &ret);
+        k = kh_put(fqid_hash, provider->fqid_caches[level], key, &ret);
         if (ret >= 0) {
-            kh_key(ipmeta->fqid_caches[level], k) = strdup(key);
-            kh_value(ipmeta->fqid_caches[level], k) = fqid;
+            kh_key(provider->fqid_caches[level], k) = strdup(key);
+            kh_value(provider->fqid_caches[level], k) = fqid;
         }
     }
 

@@ -541,8 +541,9 @@ void ipmeta_write_record_header(iow_t *file);
 /** Derives a suitable FQID for the location described by the given
  *  ipmeta record.
  *
- *  @param ipmeta   An ipmeta instance. If not NULL, the derived FQID will
- *                  be cached to speed up future calls to this method for
+ *  @param provider An ipmeta provider instance.
+ *                  If not NULL, the derived FQID will be cached to speed up
+ *                  future calls to this method for
  *                  the same location.
  *  @param record   The record to get an FQID for.
  *  @param level    The level of geographic detail that the FQID must provide
@@ -550,15 +551,15 @@ void ipmeta_write_record_header(iow_t *file);
  *  @return a string containing the desired FQID, or NULL if there was
  *          insufficient detail in the record to produce the requested FQID.
  *
- *  @note VERY IMPORTANT: if the caller provides NULL as the ipmeta parameter,
+ *  @note VERY IMPORTANT: if the caller provides NULL as the provider parameter,
  *        then the caller MUST free the returned string when they are finished
- *        with it. If the ipmeta parameter is NOT NULL, then the caller MUST
- *        NOT free the FQID string, as the ipmeta instance will handle that
+ *        with it. If the provider parameter is NOT NULL, then the caller MUST
+ *        NOT free the FQID string, as the provider instance will handle that
  *        when it is destroyed.
  *  @note this method will return NULL if called on a record with no
  *        geographic information (i.e. only ASN data).
  */
-const char *ipmeta_derive_geo_fqid_from_record(ipmeta_t *ipmeta,
+const char *ipmeta_derive_geo_fqid_from_record(ipmeta_provider_t *provider,
         ipmeta_record_t *record, ipmeta_detail_t level);
 
 /** Get an array of all the metadata records registered with the given

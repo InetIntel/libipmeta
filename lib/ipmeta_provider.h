@@ -191,6 +191,11 @@ struct ipmeta_provider {
   /** An opaque pointer to provider-specific state if needed by the provider */
   void *state;
 
+  /** A cache of all FQIDs for each geographic entity recognised by this
+   *  provider.
+   */
+  kh_fqid_hash_t *fqid_caches[IPMETA_GEO_DETAIL_LAST];
+
   /** }@ */
 };
 

@@ -158,6 +158,7 @@ int ipmeta_provider_alloc_all(ipmeta_t *ipmeta)
 int ipmeta_provider_init(ipmeta_t *ipmeta, ipmeta_provider_t *provider,
                          int argc, char **argv)
 {
+  int i;
   assert(ipmeta != NULL);
   assert(provider != NULL);
 
@@ -175,6 +176,10 @@ int ipmeta_provider_init(ipmeta_t *ipmeta, ipmeta_provider_t *provider,
   /* initialize the record hash */
   provider->all_records = kh_init(ipmeta_rechash);
   provider->ds = ipmeta->datastore;
+  for (i = 0; i < IPMETA_GEO_DETAIL_LAST; i++) {
+    provider->fqid_caches[i] = kh_init(fqid_hash);
+  }
+
 
   /* now that we have set up the datastructure stuff, ask the provider to
      initialize. this will normally mean that it reads in some database and
@@ -200,6 +205,9 @@ err:
 
 void ipmeta_provider_free(ipmeta_t *ipmeta, ipmeta_provider_t *provider)
 {
+  int i;
+  khiter_t k;
+
   assert(ipmeta != NULL);
   assert(provider != NULL);
   /* only free everything if we were enabled */
@@ -218,6 +226,16 @@ void ipmeta_provider_free(ipmeta_t *ipmeta, ipmeta_provider_t *provider)
       kh_destroy(ipmeta_rechash, provider->all_records);
       provider->all_records = NULL;
     }
+    for (i = 0; i < IPMETA_GEO_DETAIL_LAST; i++) {
+      for (k = 0; k < kh_end(provider->fqid_caches[i]); ++k) {
+        if (kh_exist(provider->fqid_caches[i], k)) {
+          free((void *)kh_key(provider->fqid_caches[i], k));
+          free((void *)kh_value(provider->fqid_caches[i], k));
+        }
+      }
+      kh_destroy(fqid_hash, provider->fqid_caches[i]);
+    }
+
   }
 
   /* finally, free the actual provider structure */
