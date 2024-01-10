@@ -241,8 +241,7 @@ static void insert_ipinfo_record(ipmeta_provider_t *provider,
     if (state->record->region) {
         char *endptr;
         unsigned long conv = strtoul(state->record->region, &endptr, 10);
-        if ((errno == ERANGE && (conv == ULONG_MAX || conv == 0)) ||
-                (errno != 0 && conv == 0)) {
+        if ((errno == EINVAL || errno == ERANGE) && conv == ULONG_MAX) {
             fprintf(stderr,
                 "ERROR: strtoul failure (input was '%s')\n",
                 state->record->region);
