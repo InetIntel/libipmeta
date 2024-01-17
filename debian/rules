@@ -27,7 +27,7 @@ configure:
 configure-stamp: configure
 	dh_testdir
 
-	dh_autoreconf
+	./autogen.sh
 
 	./configure $(CONFFLAGS) \
 		   --prefix=/usr \
