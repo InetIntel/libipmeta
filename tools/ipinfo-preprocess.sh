@@ -58,9 +58,11 @@ if [[ ${OUTPUT} == "" ]]; then
     usage
 fi
 
+
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 echo "Preprocessing ${INPUT}"
 
-python3 process-ipinfo.py -u ${UNKNOWN} -l ${REGIONMAP} -i ${INPUT} -o /tmp/ipinfo-processed.gz
+python3 ${SCRIPT_DIR}/process-ipinfo.py -u ${UNKNOWN} -l ${REGIONMAP} -i ${INPUT} -o /tmp/ipinfo-processed.gz
 
 echo "Processing complete, sorting output...."
 

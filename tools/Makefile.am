@@ -35,7 +35,7 @@ AM_CPPFLAGS = -I$(top_srcdir) -I$(top_srcdir)/common -I$(top_srcdir)/lib \
 	-I$(top_srcdir)/lib/datastructures \
 	-I$(top_srcdir)/lib/providers
 
-dist_bin_SCRIPTS =
+dist_bin_SCRIPTS = ipinfo-preprocess.sh process-ipinfo.py
 
 bin_PROGRAMS = ipmeta-lookup
 

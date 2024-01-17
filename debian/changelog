@@ -1,3 +1,15 @@
+libipmeta2 (3.2.2-1~gt001) unstable; urgency=medium
+
+  * Add provider for pre-processed IPInfo geo-location data
+  * Add scripts to pre-process IPInfo geo-location data
+  * Add API method (ipmeta_derive_geo_fqid_from_record()) that can
+    derive the FQID for a location described in a particular IPmeta record.
+  * Add country code for Kosovo (XK).
+  * Add API method (ipmeta_clean_record()) that will free any record
+    content, but not free the record itself so that it can be reused.
+
+ -- Shane Alcock <shane@alcock.co.nz>  Thu, 18 Jan 2024 11:13:48 +1300
+
 libipmeta2 (3.2.1-1) unstable; urgency=medium
 
   * Remove repeated call to AM_INIT_AUTOMAKE in configure.ac.

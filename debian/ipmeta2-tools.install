@@ -1,1 +1,3 @@
 usr/bin/ipmeta-lookup
+usr/bin/process-ipinfo.py
+usr/bin/ipinfo-preprocess.sh
