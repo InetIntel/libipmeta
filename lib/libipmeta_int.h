@@ -51,6 +51,8 @@
 
 KHASH_MAP_INIT_INT(ipmeta_rechash, struct ipmeta_record *)
 
+KHASH_MAP_INIT_STR(fqid_hash, const char *)
+
 /**
  * @name Internal Datastructures
  *

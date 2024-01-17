@@ -105,23 +105,18 @@ typedef struct ipmeta_provider_ipinfo_state {
     ipmeta_record_t *record;
     ipvx_prefix_t block_lower;
     ipvx_prefix_t block_upper;
+    int rec_prefix_count;
+
+    ipvx_prefix_t block_lower_first;
+    ipvx_prefix_t block_upper_last;
 
     const char *current_filename;
 
     /** map from country to continent */
     khash_t(u16u16) *country_continent;
 
-    /** set of timezone strings */
-    kh_str_set_t *timezones;
-
-    /** set of region name strings */
+    /** set of region ID strings */
     kh_str_set_t *regions;
-
-    /** set of city name strings */
-    kh_str_set_t *cities;
-
-    /** set of postcode strings */
-    kh_str_set_t *postcodes;
 
 } ipmeta_provider_ipinfo_state_t;
 
@@ -129,14 +124,8 @@ typedef struct ipmeta_provider_ipinfo_state {
 typedef enum column_list {
     LOCATION_COL_STARTIP,       ///< Range Start IP
     LOCATION_COL_ENDIP,         ///< Range End IP
-    LOCATION_COL_JOINKEY,       ///< Join key (ignored)
-    LOCATION_COL_CITY,          ///< City String
     LOCATION_COL_REGION,        ///< Region String
     LOCATION_COL_COUNTRY,       ///< 2 Char Country Code
-    LOCATION_COL_LAT,           ///< Latitude
-    LOCATION_COL_LONG,          ///< Longitude
-    LOCATION_COL_POSTCODE,      ///< Postal Code String
-    LOCATION_COL_TZ,            ///< Time Zone
     LOCATION_COL_ENDCOL,        ///< 1 past the last column ID
 } location_cols_t;
 
@@ -144,7 +133,7 @@ typedef enum column_list {
 static void usage(ipmeta_provider_t *provider) {
     fprintf(stderr,
         "provider usage: %s -l locations\n"
-        "    -l <file>  The file containing the location data\n",
+        "    -l <file>  The file containing the pre-processed location data\n",
         provider->name);
 }
 
@@ -218,6 +207,98 @@ static char *insert_name_into_set(char *name, kh_str_set_t **set) {
     return NULL;
 }
 
+static void insert_ipinfo_record(ipmeta_provider_t *provider,
+        ipmeta_provider_ipinfo_state_t *state) {
+
+    ipvx_prefix_list_t *pfx_list, *pfx_node;
+
+    khiter_t khiter;
+
+    if (state->record == NULL || state->record->id == 0 ||
+            state->rec_prefix_count == 0) {
+        goto insdone;
+    }
+
+    if (state->block_lower_first.family == AF_UNSPEC ||
+            state->block_upper_last.family == AF_UNSPEC) {
+        goto insdone;
+    }
+
+    char *cc = state->record->country_code;
+    if ((khiter = kh_get(u16u16, state->country_continent, c2_to_u16(cc))) ==
+            kh_end(state->country_continent)) {
+        fprintf(stderr, "ERROR: Unknown country code (%s)\n", cc);
+        goto insdone;
+    }
+    uint16_t cont = kh_value(state->country_continent, khiter);
+    u16_to_c2(cont, state->record->continent_code);
+
+    /* store the numeric equivalent of the region code
+     *
+     * consider caching if start-up performance is an issue due to
+     * repeated string-to-integer conversions XXX
+     */
+    if (state->record->region) {
+        char *endptr;
+        unsigned long conv = strtoul(state->record->region, &endptr, 10);
+        if ((errno == EINVAL || errno == ERANGE) && conv == ULONG_MAX) {
+            fprintf(stderr,
+                "ERROR: strtoul failure (input was '%s')\n",
+                state->record->region);
+            goto insdone;
+        }
+
+        if (endptr == state->record->region) {
+            fprintf(stderr,
+                "ERROR: region must be a valid numeric identifier (not '%s')\n",
+                state->record->region);
+            goto insdone;
+        }
+
+        if (conv > UINT16_MAX) {
+            fprintf(stderr,
+                "ERROR: region code was unexpectedly large: %lu\n", conv);
+            goto insdone;
+        }
+        state->record->region_code = (uint16_t)conv;
+    }
+
+    ipmeta_provider_insert_record(provider, state->record);
+    /* pre-cache record FQIDs for faster future lookup */
+    ipmeta_derive_geo_fqid_from_record(provider, state->record,
+            IPMETA_GEO_DETAIL_REGION);
+
+    if (ipvx_range_to_prefix(&state->block_lower_first,
+            &state->block_upper_last, &pfx_list) != 0) {
+        fprintf(stderr, "%s\n", "Could not convert IP range to prefixes");
+        goto insdone;
+    }
+    if (pfx_list == NULL) {
+        goto insdone;
+    }
+
+    for (pfx_node = pfx_list; pfx_node != NULL; pfx_node = pfx_node->next) {
+        if (ipmeta_provider_associate_record(provider,
+                pfx_node->prefix.family, &(pfx_node->prefix.addr),
+                pfx_node->prefix.masklen, state->record) != 0) {
+            fprintf(stderr, "%s\n", "Failed to associate record with prefix");
+            goto insdone;
+        }
+    }
+    ipvx_prefix_list_free(pfx_list);
+
+insdone:
+    state->record = malloc_zero(sizeof(ipmeta_record_t));
+    state->record->id = state->next_record_id;
+    state->next_record_id ++;
+    state->rec_prefix_count = 0;
+
+    memcpy(&(state->block_lower_first), &(state->block_lower),
+            sizeof(ipvx_prefix_t));
+    memcpy(&(state->block_upper_last), &(state->block_upper),
+            sizeof(ipvx_prefix_t));
+}
+
 static void parse_ipinfo_cell(void *s, size_t i, void *data) {
     ipmeta_provider_t *provider = (ipmeta_provider_t *)data;
     ipmeta_provider_ipinfo_state_t *state = STATE(provider);
@@ -225,38 +306,49 @@ static void parse_ipinfo_cell(void *s, size_t i, void *data) {
     char *end;
     unsigned char buf[sizeof(struct in6_addr)];
     int ret;
+    char cc[2];
+    char *region = NULL;
 
 #define rec (state->record)  /* convenient code abbreviation */
 
     switch(state->current_column) {
         case LOCATION_COL_STARTIP:
-            rec = malloc_zero(sizeof(ipmeta_record_t));
+            if (rec == NULL) {
+                rec = malloc_zero(sizeof(ipmeta_record_t));
+                rec->id = state->next_record_id;
+                state->next_record_id ++;
+                state->rec_prefix_count = 0;
+            }
 
             if (strchr(tok, ':')) {
                 /* ipv6 */
                 if (state->skip_ipv6) {
-                    rec->id = 0;
+                    state->block_lower.family = AF_UNSPEC;
                     break;
                 }
                 state->block_lower.family = AF_INET6;
                 state->block_lower.masklen = 128;
-                ret = inet_pton(AF_INET6, tok, &(state->block_lower.addr.v6));
+                ret = inet_pton(AF_INET6, tok,
+                        &(state->block_lower.addr.v6));
             } else {
                 state->block_lower.family = AF_INET;
                 state->block_lower.masklen = 32;
                 ret = inet_pton(AF_INET, tok, &(state->block_lower.addr.v4));
             }
+
             if (ret <= 0) {
                 col_invalid(state, "Invalid start IP", tok);
             }
-            rec->id = state->next_record_id;
-            state->next_record_id ++;
+            if (state->rec_prefix_count == 0) {
+                memcpy(&(state->block_lower_first), &(state->block_lower),
+                        sizeof(ipvx_prefix_t));
+            }
             break;
         case LOCATION_COL_ENDIP:
             if (strchr(tok, ':')) {
                 /* ipv6 */
                 if (state->skip_ipv6) {
-                    rec->id = 0;
+                    state->block_upper.family = AF_UNSPEC;
                     break;
                 }
                 state->block_upper.family = AF_INET6;
@@ -274,46 +366,33 @@ static void parse_ipinfo_cell(void *s, size_t i, void *data) {
         case LOCATION_COL_COUNTRY:
             // country code
             if (!tok || !*tok || (tok[0] == '-' && tok[1] == '-')) {
-                rec->country_code[0] = '?';
-                rec->country_code[1] = '?';
+                cc[0] = cc[1] = '?';
             } else if (strlen(tok) != 2) {
                 col_invalid(state, "Invalid country code", tok);
             } else {
-                memcpy(rec->country_code, tok, 2);
+                memcpy(cc, tok, 2);
             }
-            break;
-        case LOCATION_COL_CITY:
-            rec->city = insert_name_into_set(tok, &(state->cities));
+
+            if (state->rec_prefix_count > 0 && (cc[0] != rec->country_code[0]
+                    || cc[1] != rec->country_code[1])) {
+                insert_ipinfo_record(provider, state);
+            }
+            rec->country_code[0] = cc[0];
+            rec->country_code[1] = cc[1];
             break;
         case LOCATION_COL_REGION:
-            rec->region = insert_name_into_set(tok, &(state->regions));
-            break;
-        case LOCATION_COL_POSTCODE:
-            rec->post_code = insert_name_into_set(tok, &(state->postcodes));
-            break;
-        case LOCATION_COL_TZ:
-            rec->timezone = insert_name_into_set(tok, &(state->timezones));
-            break;
-        case LOCATION_COL_LAT:
-            if (tok && *tok) {
-                rec->latitude = strtod(tok, &end);
-                if (end == tok || *end || rec->latitude < -90 ||
-                        rec->latitude > 90) {
-                    col_invalid(state, "Invalid latitude", tok);
+            region = insert_name_into_set(tok, &(state->regions));
+            if (state->rec_prefix_count > 0) {
+                if (region == NULL && rec->region != NULL) {
+                    insert_ipinfo_record(provider, state);
+                } else if (region != NULL && rec->region == NULL) {
+                    insert_ipinfo_record(provider, state);
+                } else if (region != NULL && strcmp(region, rec->region) != 0) {
+                    insert_ipinfo_record(provider, state);
                 }
             }
+            rec->region = region;
             break;
-        case LOCATION_COL_LONG:
-            if (tok && *tok) {
-                rec->longitude = strtod(tok, &end);
-                if (end == tok || *end || rec->longitude < -180 ||
-                        rec->longitude > 180) {
-                    col_invalid(state, "Invalid longitude", tok);
-                }
-            }
-            break;
-        case LOCATION_COL_JOINKEY:
-            break; // unused
         default:
             col_invalid(state, "Unexpected trailing column", tok);
     }
@@ -324,48 +403,15 @@ static void parse_ipinfo_cell(void *s, size_t i, void *data) {
 static void parse_ipinfo_row(int c, void *data) {
     ipmeta_provider_t *provider = (ipmeta_provider_t *)data;
     ipmeta_provider_ipinfo_state_t *state = STATE(provider);
-    ipvx_prefix_list_t *pfx_list, *pfx_node;
 
-    khiter_t khiter;
     check_column_count(state, LOCATION_COL_ENDCOL);
 
-    if (state->record == NULL || state->record->id == 0) {
-        //row_error(state, "%s", "Row did not produce a valid record");
-        goto rowdone;
-    }
-
-    char *cc = state->record->country_code;
-    if ((khiter = kh_get(u16u16, state->country_continent, c2_to_u16(cc))) ==
-            kh_end(state->country_continent)) {
-        row_error(state, "Unknown country code (%s)", cc);
-    }
-    uint16_t cont = kh_value(state->country_continent, khiter);
-    u16_to_c2(cont, state->record->continent_code);
-
-    ipmeta_provider_insert_record(provider, state->record);
-
-    if (ipvx_range_to_prefix(&state->block_lower, &state->block_upper,
-            &pfx_list) != 0) {
-        row_error(state, "%s", "Could not convert IP range to prefixes");
-    }
-    if (pfx_list == NULL) {
-        return;
-    }
-
-    for (pfx_node = pfx_list; pfx_node != NULL; pfx_node = pfx_node->next) {
-        if (ipmeta_provider_associate_record(provider,
-                pfx_node->prefix.family, &(pfx_node->prefix.addr),
-                pfx_node->prefix.masklen, state->record) != 0) {
-            row_error(state, "%s", "Failed to associate record with prefix");
-        }
-    }
-    ipvx_prefix_list_free(pfx_list);
-
-rowdone:
+    state->rec_prefix_count ++;
     state->current_line ++;
     state->current_column = 0;
-    state->record = NULL;
 
+    memcpy(&(state->block_upper_last), &(state->block_upper),
+            sizeof(ipvx_prefix_t));
     return;
 }
 
@@ -408,10 +454,7 @@ static int read_ipinfo_file(ipmeta_provider_t *provider, const char *filename) {
     state->current_line = 0;
     state->parse_row = NULL;
 
-    state->timezones = kh_init(str_set);
     state->regions = kh_init(str_set);
-    state->postcodes = kh_init(str_set);
-    state->cities = kh_init(str_set);
 
     while (state->first_column < 0) {
         read = wandio_fgets(file, &buffer, BUFFER_LEN, 0);
@@ -464,6 +507,10 @@ static int read_ipinfo_file(ipmeta_provider_t *provider, const char *filename) {
                 csv_strerror(csv_error(&(state->parser))));
         goto end;
     }
+
+    if (state->rec_prefix_count > 0) {
+        insert_ipinfo_record(provider, state);
+    }
     rc = 0;
 
 end:
@@ -514,15 +561,6 @@ void ipmeta_provider_ipinfo_free(ipmeta_provider_t *provider) {
             state->locations_file = NULL;
         }
 
-        if (state->timezones) {
-            for (k = 0; k < kh_end(state->timezones); ++k) {
-                if (kh_exist(state->timezones, k)) {
-                    free((void *)kh_key(state->timezones, k));
-                }
-            }
-            kh_destroy(str_set, state->timezones);
-        }
-
         if (state->regions) {
             for (k = 0; k < kh_end(state->regions); ++k) {
                 if (kh_exist(state->regions, k)) {
@@ -532,27 +570,14 @@ void ipmeta_provider_ipinfo_free(ipmeta_provider_t *provider) {
             kh_destroy(str_set, state->regions);
         }
 
-        if (state->cities) {
-            for (k = 0; k < kh_end(state->cities); ++k) {
-                if (kh_exist(state->cities, k)) {
-                    free((void *)kh_key(state->cities, k));
-                }
-            }
-            kh_destroy(str_set, state->cities);
-        }
-
-        if (state->postcodes) {
-            for (k = 0; k < kh_end(state->postcodes); ++k) {
-                if (kh_exist(state->postcodes, k)) {
-                    free((void *)kh_key(state->postcodes, k));
-                }
-            }
-            kh_destroy(str_set, state->postcodes);
-        }
 
         if (state->country_continent) {
             kh_destroy(u16u16, state->country_continent);
             state->country_continent = NULL;
+        }
+
+        if (state->record) {
+            ipmeta_free_record(state->record);
         }
 
         ipmeta_provider_free_state(provider);
