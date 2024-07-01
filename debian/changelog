@@ -1,3 +1,10 @@
+libipmeta2 (3.2.2-1~gt002) unstable; urgency=medium
+
+  * Remove IPInfo pre-processing scripts -- these are now in a
+    separate repository / package.
+
+ -- Shane Alcock <shane@alcock.co.nz>  Tue, 02 Jul 2024 10:30:19 +1200
+
 libipmeta2 (3.2.2-1~gt001) unstable; urgency=medium
 
   * Add provider for pre-processed IPInfo geo-location data
